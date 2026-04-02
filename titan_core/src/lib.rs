@@ -10,6 +10,11 @@ use crate::model::TitanTransformer;
 use pyo3::prelude::*;
 use tokenizers::Tokenizer;
 
+/// Helper to convert candle errors into PyValueError.
+fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e))
+}
+
 #[pyclass]
 pub struct PyTitanTransformer {
     inner: TitanTransformer,
@@ -29,15 +34,25 @@ impl PyTitanTransformer {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-        let inner = TitanTransformer::new(vocab_size, dim, num_layers, vb)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let inner = TitanTransformer::new(vocab_size, dim, num_layers, vb).map_err(to_py_err)?;
 
-        // Matrix-based memory states [dim, dim]
-        let memory_states = vec![Tensor::zeros((dim, dim), DType::F32, &device).unwrap(); num_layers];
-        // Program states [1, dim]
-        let program_states = vec![Tensor::zeros((1, dim), DType::F32, &device).unwrap(); num_layers];
+        // Initialize states
+        let mut memory_states = Vec::with_capacity(num_layers);
+        let mut program_states = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            memory_states.push(Tensor::zeros((dim, dim), DType::F32, &device).map_err(to_py_err)?);
+            program_states.push(Tensor::zeros((1, dim), DType::F32, &device).map_err(to_py_err)?);
+        }
 
-        Ok(Self { inner, varmap, dim, num_layers, memory_states, program_states, optimizer: None })
+        Ok(Self {
+            inner,
+            varmap,
+            dim,
+            num_layers,
+            memory_states,
+            program_states,
+            optimizer: None,
+        })
     }
 
     fn init_optimizer(&mut self, lr: f64) -> PyResult<()> {
@@ -45,28 +60,29 @@ impl PyTitanTransformer {
             lr,
             ..Default::default()
         };
-        let opt = AdamW::new(self.varmap.all_vars(), params)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let opt = AdamW::new(self.varmap.all_vars(), params).map_err(to_py_err)?;
         self.optimizer = Some(opt);
         Ok(())
     }
 
     fn save_weights(&self, path: String) -> PyResult<()> {
-        self.varmap.save(path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        self.varmap.save(path).map_err(to_py_err)?;
         Ok(())
     }
 
     fn load_weights(&mut self, path: String) -> PyResult<()> {
-        self.varmap.load(path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        self.varmap.load(path).map_err(to_py_err)?;
         Ok(())
     }
 
     fn reset_state(&mut self) -> PyResult<()> {
         let device = Device::Cpu;
-        self.memory_states = vec![Tensor::zeros((self.dim, self.dim), DType::F32, &device).unwrap(); self.num_layers];
-        self.program_states = vec![Tensor::zeros((1, self.dim), DType::F32, &device).unwrap(); self.num_layers];
+        for i in 0..self.num_layers {
+            self.memory_states[i] =
+                Tensor::zeros((self.dim, self.dim), DType::F32, &device).map_err(to_py_err)?;
+            self.program_states[i] =
+                Tensor::zeros((1, self.dim), DType::F32, &device).map_err(to_py_err)?;
+        }
         Ok(())
     }
 
@@ -76,21 +92,20 @@ impl PyTitanTransformer {
         if n == 0 {
             return Ok(vec![]);
         }
-        let x = Tensor::from_vec(x_ids, Shape::from(n), &device)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let x = Tensor::from_vec(x_ids, Shape::from(n), &device).map_err(to_py_err)?;
 
-        let out = self.inner
+        let out = self
+            .inner
             .forward(&x, &mut self.memory_states, &mut self.program_states)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+            .map_err(to_py_err)?;
 
-        let (rows, cols) = out.dims2()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let (rows, cols) = out.dims2().map_err(to_py_err)?;
 
         let flattened = out
             .reshape(rows * cols)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?
+            .map_err(to_py_err)?
             .to_vec1::<f32>()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+            .map_err(to_py_err)?;
 
         Ok(flattened)
     }
@@ -101,29 +116,23 @@ impl PyTitanTransformer {
         if n == 0 {
             return Ok(0.0);
         }
-        let x = Tensor::from_vec(x_ids, Shape::from(n), &device)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
-        let targets = Tensor::from_vec(target_ids, Shape::from(n), &device)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let x = Tensor::from_vec(x_ids, Shape::from(n), &device).map_err(to_py_err)?;
+        let targets = Tensor::from_vec(target_ids, Shape::from(n), &device).map_err(to_py_err)?;
 
-        let logits = self.inner
+        let logits = self
+            .inner
             .forward(&x, &mut self.memory_states, &mut self.program_states)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+            .map_err(to_py_err)?;
 
-        let log_sm = candle_nn::ops::log_softmax(&logits, candle_core::D::Minus1)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let log_sm = candle_nn::ops::log_softmax(&logits, candle_core::D::Minus1).map_err(to_py_err)?;
 
-        let loss = candle_nn::loss::nll(&log_sm, &targets)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let loss = candle_nn::loss::nll(&log_sm, &targets).map_err(to_py_err)?;
 
         if let Some(opt) = &mut self.optimizer {
-            opt.backward_step(&loss)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+            opt.backward_step(&loss).map_err(to_py_err)?;
         }
 
-        let loss_val = loss
-            .to_vec0::<f32>()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let loss_val = loss.to_vec0::<f32>().map_err(to_py_err)?;
 
         Ok(loss_val)
     }

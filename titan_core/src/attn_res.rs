@@ -1,20 +1,22 @@
 use candle_core::{Tensor, Result, D};
 use candle_nn::{VarBuilder, linear, Linear, rms_norm, RmsNorm};
 
+/// Full Attention Residuals.
+/// Aggregates all previous layer outputs using a learned pseudo-attention mechanism.
 pub struct FullAttnRes {
     proj: Linear,
     norm: Option<RmsNorm>,
-    #[allow(dead_code)]
-    dim: usize,
 }
 
 impl FullAttnRes {
+    /// Creates a new `FullAttnRes` instance.
     pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
         let proj = linear(dim, 1, vb.pp("proj"))?; // Pseudo-query projection
         let norm = rms_norm(dim, 1e-5, vb.pp("norm")).ok();
-        Ok(Self { proj, norm, dim })
+        Ok(Self { proj, norm })
     }
 
+    /// Performs the forward pass of the attention residual block.
     pub fn forward(&self, hidden_states: &[Tensor]) -> Result<Tensor> {
         if hidden_states.is_empty() {
              candle_core::bail!("hidden_states cannot be empty");
@@ -49,20 +51,21 @@ impl FullAttnRes {
     }
 }
 
-/// Block Attention Residuals
+/// Block Attention Residuals.
 /// Partitions layers into blocks for memory efficiency.
 pub struct BlockAttnRes {
     proj: Linear,
-    #[allow(dead_code)]
     block_size: usize,
 }
 
 impl BlockAttnRes {
+    /// Creates a new `BlockAttnRes` instance.
     pub fn new(dim: usize, block_size: usize, vb: VarBuilder) -> Result<Self> {
         let proj = linear(dim, 1, vb.pp("proj"))?;
         Ok(Self { proj, block_size })
     }
 
+    /// Performs the forward pass of the block attention residual block.
     pub fn forward(&self, block_outputs: &[Tensor], current_state: &Tensor) -> Result<Tensor> {
         if block_outputs.is_empty() {
             return Ok(current_state.clone());

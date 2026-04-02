@@ -5,6 +5,7 @@ use crate::titans::TitansMemory;
 use crate::emulator::PythonEmulator;
 use crate::quant::PolarQuant;
 
+/// Main Titan Transformer model.
 pub struct TitanTransformer {
     embedding: Embedding,
     layers: Vec<TitanLayer>,
@@ -12,18 +13,21 @@ pub struct TitanTransformer {
     output: Linear,
 }
 
+/// Feed-Forward Network (FFN) block.
 pub struct FFN {
     up_proj: Linear,
     down_proj: Linear,
 }
 
 impl FFN {
+    /// Creates a new FFN block.
     pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
         let up_proj = linear(dim, dim * 4, vb.pp("up_proj"))?;
         let down_proj = linear(dim * 4, dim, vb.pp("down_proj"))?;
         Ok(Self { up_proj, down_proj })
     }
 
+    /// Performs the forward pass of the FFN block.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = x.apply(&self.up_proj)?;
         let h = candle_nn::ops::silu(&h)?;
@@ -31,6 +35,7 @@ impl FFN {
     }
 }
 
+/// A single layer of the Titan Transformer.
 pub struct TitanLayer {
     pub memory: TitansMemory,
     pub emulator: PythonEmulator,
@@ -41,6 +46,7 @@ pub struct TitanLayer {
 }
 
 impl TitanTransformer {
+    /// Creates a new Titan Transformer model.
     pub fn new(vocab_size: usize, dim: usize, num_layers: usize, vb: VarBuilder) -> Result<Self> {
         let embedding = embedding(vocab_size, dim, vb.pp("embedding"))?;
         let mut layers = Vec::with_capacity(num_layers);
@@ -57,10 +63,21 @@ impl TitanTransformer {
         }
         let norm_final = rms_norm(dim, 1e-5, vb.pp("norm_final"))?;
         let output = linear(dim, vocab_size, vb.pp("output"))?;
-        Ok(Self { embedding, layers, norm_final, output })
+        Ok(Self {
+            embedding,
+            layers,
+            norm_final,
+            output,
+        })
     }
 
-    pub fn forward(&self, x: &Tensor, memory_states: &mut [Tensor], program_states: &mut [Tensor]) -> Result<Tensor> {
+    /// Performs the forward pass of the model.
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        memory_states: &mut [Tensor],
+        program_states: &mut [Tensor],
+    ) -> Result<Tensor> {
         let mut h = x.apply(&self.embedding)?;
         let mut layer_outputs = Vec::with_capacity(self.layers.len() + 1);
         layer_outputs.push(h.clone());
