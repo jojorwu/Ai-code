@@ -7,7 +7,10 @@ impl PolarQuant {
     pub fn compress(x: &Tensor) -> Result<(Tensor, Tensor)> {
         // Compute the norm (radius) and normalized direction (angle-like)
         let radius = x.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
-        let direction = x.broadcast_div(&radius)?;
+        // Add epsilon to avoid division by zero
+        let eps = Tensor::new(&[1e-8f32], x.device())?.broadcast_as(radius.shape())?;
+        let radius_safe = radius.add(&eps)?;
+        let direction = x.broadcast_div(&radius_safe)?;
         Ok((radius, direction))
     }
 

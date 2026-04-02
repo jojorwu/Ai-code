@@ -16,6 +16,7 @@ serde_json = "1.0"
 anyhow = "1.0"
 half = { version = "2.3", features = ["num-traits", "use-intrinsics"] }
 rand = "0.8"
+tokenizers = "0.21.0"
 
 [dev-dependencies]
 candle-datasets = "0.8.2"

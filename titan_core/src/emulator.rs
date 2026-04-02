@@ -14,9 +14,12 @@ impl PythonEmulator {
     }
 
     pub fn step(&self, instruction_rep: &Tensor, current_state: &Tensor) -> Result<Tensor> {
-        // Simple state update mechanism: h_next = f(h_curr + instruction)
+        // instruction_rep is [T, D]
+        // Aggregate instructions in the sequence to update the persistent state [1, D]
         let instruction_processed = instruction_rep.apply(&self.state_updater)?;
-        current_state.broadcast_add(&instruction_processed)?
+        let instruction_agg = instruction_processed.mean_keepdim(0)?; // [1, D]
+
+        current_state.broadcast_add(&instruction_agg)?
             .tanh()
     }
 }

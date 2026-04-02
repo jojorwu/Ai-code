@@ -3,6 +3,7 @@ use candle_nn::{VarBuilder, linear, Linear, embedding, Embedding};
 use crate::attn_res::FullAttnRes;
 use crate::titans::TitansMemory;
 use crate::emulator::PythonEmulator;
+use crate::quant::PolarQuant;
 
 pub struct TitanTransformer {
     embedding: Embedding,
@@ -39,17 +40,21 @@ impl TitanTransformer {
         layer_outputs.push(h_initial);
 
         for (i, layer) in self.layers.iter().enumerate() {
+            let (radius, direction) = PolarQuant::compress(&h)?;
+            let h_quantized = PolarQuant::decompress(&radius, &direction)?;
+
             // Memory update
-            let (mem_out, new_mem) = layer.memory.forward(&h, &memory_states[i])?;
+            let (mem_out, new_mem) = layer.memory.forward(&h_quantized, &memory_states[i])?;
             memory_states[i] = new_mem;
 
             // Emulator update
-            let new_prog = layer.emulator.step(&h, &program_states[i])?;
+            let new_prog = layer.emulator.step(&h_quantized, &program_states[i])?;
             program_states[i] = new_prog.clone();
 
-            // Combine with broadcasting
-            h = (h.clone() + mem_out)?;
-            h = (h.clone() + new_prog)?;
+            // Combine
+            // mem_out and new_prog are [1, D]. h is [T, D].
+            h = h.broadcast_add(&mem_out)?;
+            h = h.broadcast_add(&new_prog)?;
 
             // Apply Attention Residuals over all previous layer outputs
             layer_outputs.push(h.clone());
