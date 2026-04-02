@@ -43,7 +43,7 @@ impl TitanTransformer {
             let (radius, direction) = PolarQuant::compress(&h)?;
             let h_quantized = PolarQuant::decompress(&radius, &direction)?;
 
-            // Memory update
+            // Memory update (now matrix-based)
             let (mem_out, new_mem) = layer.memory.forward(&h_quantized, &memory_states[i])?;
             memory_states[i] = new_mem;
 
@@ -52,7 +52,6 @@ impl TitanTransformer {
             program_states[i] = new_prog.clone();
 
             // Combine
-            // mem_out and new_prog are [1, D]. h is [T, D].
             h = h.broadcast_add(&mem_out)?;
             h = h.broadcast_add(&new_prog)?;
 

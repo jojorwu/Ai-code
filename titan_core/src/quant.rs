@@ -20,11 +20,20 @@ impl PolarQuant {
 }
 
 /// Quantized Johnson-Lindenstrauss (QJL)
+/// Implements 1-bit quantization.
 pub struct QJL;
 
 impl QJL {
     pub fn compress(x: &Tensor) -> Result<Tensor> {
         // One-bit quantization: sign(x)
+        // map -1, 1 to 0, 1 conceptually or just keep -1, 1
         x.sign()
+    }
+
+    /// Combined PolarQuant + QJL approach
+    pub fn compress_pq_qjl(x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (radius, direction) = PolarQuant::compress(x)?;
+        let quantized_direction = Self::compress(&direction)?;
+        Ok((radius, quantized_direction))
     }
 }

@@ -48,3 +48,44 @@ impl FullAttnRes {
         Ok(aggregated)
     }
 }
+
+/// Block Attention Residuals
+/// Partitions layers into blocks for memory efficiency.
+pub struct BlockAttnRes {
+    proj: Linear,
+    #[allow(dead_code)]
+    block_size: usize,
+}
+
+impl BlockAttnRes {
+    pub fn new(dim: usize, block_size: usize, vb: VarBuilder) -> Result<Self> {
+        let proj = linear(dim, 1, vb.pp("proj"))?;
+        Ok(Self { proj, block_size })
+    }
+
+    pub fn forward(&self, block_outputs: &[Tensor], current_state: &Tensor) -> Result<Tensor> {
+        if block_outputs.is_empty() {
+            return Ok(current_state.clone());
+        }
+
+        // Attend over completed block representations
+        let mut states = block_outputs.to_vec();
+        states.push(current_state.clone());
+
+        let mut weights = Vec::with_capacity(states.len());
+        for state in &states {
+            weights.push(state.apply(&self.proj)?);
+        }
+
+        let weights = Tensor::cat(&weights, D::Minus1)?;
+        let weights = candle_nn::ops::softmax(&weights, D::Minus1)?;
+
+        let mut aggregated = current_state.zeros_like()?;
+        for (i, state) in states.iter().enumerate() {
+            let w_i = weights.narrow(D::Minus1, i, 1)?;
+            aggregated = (aggregated + state.broadcast_mul(&w_i)?)?;
+        }
+
+        Ok(aggregated)
+    }
+}

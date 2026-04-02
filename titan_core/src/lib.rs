@@ -32,7 +32,9 @@ impl PyTitanTransformer {
         let inner = TitanTransformer::new(vocab_size, dim, num_layers, vb)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
 
-        let memory_states = vec![Tensor::zeros((1, dim), DType::F32, &device).unwrap(); num_layers];
+        // Matrix-based memory states [dim, dim]
+        let memory_states = vec![Tensor::zeros((dim, dim), DType::F32, &device).unwrap(); num_layers];
+        // Program states [1, dim]
         let program_states = vec![Tensor::zeros((1, dim), DType::F32, &device).unwrap(); num_layers];
 
         Ok(Self { inner, varmap, dim, num_layers, memory_states, program_states, optimizer: None })
@@ -63,7 +65,7 @@ impl PyTitanTransformer {
 
     fn reset_state(&mut self) -> PyResult<()> {
         let device = Device::Cpu;
-        self.memory_states = vec![Tensor::zeros((1, self.dim), DType::F32, &device).unwrap(); self.num_layers];
+        self.memory_states = vec![Tensor::zeros((self.dim, self.dim), DType::F32, &device).unwrap(); self.num_layers];
         self.program_states = vec![Tensor::zeros((1, self.dim), DType::F32, &device).unwrap(); self.num_layers];
         Ok(())
     }
