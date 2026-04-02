@@ -1,0 +1,9 @@
+target/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.so
+*.dylib
+*.dll
+titan_core/target/
