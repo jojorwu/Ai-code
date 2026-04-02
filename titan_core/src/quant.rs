@@ -1,36 +1,39 @@
 use candle_core::{Tensor, Result, D};
 
-/// PolarQuant separates the magnitude and angle.
+/// PolarQuant separates magnitude (radius) and normalized direction.
 pub struct PolarQuant;
 
 impl PolarQuant {
+    /// Compresses a tensor into its magnitude (radius) and normalized direction.
+    /// Uses an epsilon to avoid division by zero when calculating the direction.
     pub fn compress(x: &Tensor) -> Result<(Tensor, Tensor)> {
         // Compute the norm (radius) and normalized direction (angle-like)
         let radius = x.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
         // Add epsilon to avoid division by zero
-        let eps = Tensor::new(&[1e-8f32], x.device())?.broadcast_as(radius.shape())?;
-        let radius_safe = radius.add(&eps)?;
+        let radius_safe = radius.affine(1.0, 1e-8)?;
         let direction = x.broadcast_div(&radius_safe)?;
         Ok((radius, direction))
     }
 
+    /// Decompresses the magnitude and direction back into the original representation.
     pub fn decompress(radius: &Tensor, direction: &Tensor) -> Result<Tensor> {
         radius.broadcast_mul(direction)
     }
 }
 
-/// Quantized Johnson-Lindenstrauss (QJL)
+/// Quantized Johnson-Lindenstrauss (QJL).
 /// Implements 1-bit quantization.
 pub struct QJL;
 
 impl QJL {
+    /// Performs 1-bit quantization by taking the sign of each element.
     pub fn compress(x: &Tensor) -> Result<Tensor> {
         // One-bit quantization: sign(x)
-        // map -1, 1 to 0, 1 conceptually or just keep -1, 1
         x.sign()
     }
 
-    /// Combined PolarQuant + QJL approach
+    /// Combines PolarQuant and QJL approaches.
+    /// It first calculates Polar magnitude and then applies 1-bit quantization to the direction.
     pub fn compress_pq_qjl(x: &Tensor) -> Result<(Tensor, Tensor)> {
         let (radius, direction) = PolarQuant::compress(x)?;
         let quantized_direction = Self::compress(&direction)?;

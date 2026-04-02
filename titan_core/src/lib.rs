@@ -147,20 +147,17 @@ pub struct PyTokenizer {
 impl PyTokenizer {
     #[new]
     fn new(json_path: String) -> PyResult<Self> {
-        let inner = Tokenizer::from_file(json_path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let inner = Tokenizer::from_file(json_path).map_err(to_py_err)?;
         Ok(Self { inner })
     }
 
     fn encode(&self, text: String) -> PyResult<Vec<u32>> {
-        let encoding = self.inner.encode(text, true)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let encoding = self.inner.encode(text, true).map_err(to_py_err)?;
         Ok(encoding.get_ids().to_vec())
     }
 
     fn decode(&self, ids: Vec<u32>) -> PyResult<String> {
-        let text = self.inner.decode(&ids, true)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+        let text = self.inner.decode(&ids, true).map_err(to_py_err)?;
         Ok(text)
     }
 }

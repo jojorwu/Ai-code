@@ -19,29 +19,37 @@ impl FullAttnRes {
     /// Performs the forward pass of the attention residual block.
     pub fn forward(&self, hidden_states: &[Tensor]) -> Result<Tensor> {
         if hidden_states.is_empty() {
-             candle_core::bail!("hidden_states cannot be empty");
+            candle_core::bail!("hidden_states cannot be empty");
         }
 
         let l = hidden_states.len();
-        let last_state = &hidden_states[l - 1];
 
         // Compute attention weights over all previous layers
-        let mut weights = Vec::with_capacity(l);
+        // hidden_states is Vec<[T, D]>
+        let mut state_stack = Vec::with_capacity(l);
+        let mut weight_stack = Vec::with_capacity(l);
         for state in hidden_states {
-            let w = state.apply(&self.proj)?; // [B, T, 1]
-            weights.push(w);
+            // [T, D] -> [1, T, D]
+            state_stack.push(state.unsqueeze(0)?);
+            // [T, D] -> [T, 1]
+            weight_stack.push(state.apply(&self.proj)?);
         }
 
-        let weights = Tensor::cat(&weights, D::Minus1)?; // [B, T, L]
+        // Stack all previous states: [L, T, D]
+        let all_states = Tensor::cat(&state_stack, 0)?;
+        // Concatenate weights: [T, L]
+        let weights = Tensor::cat(&weight_stack, D::Minus1)?;
+        // Normalize weights over layers: [T, L]
         let weights = candle_nn::ops::softmax(&weights, D::Minus1)?;
 
-        // Aggregate
-        let mut aggregated = last_state.zeros_like()?;
-        for (i, state) in hidden_states.iter().enumerate() {
-            let w_i = weights.narrow(D::Minus1, i, 1)?; // [B, T, 1]
-            let weighted_state = state.broadcast_mul(&w_i)?;
-            aggregated = (aggregated + weighted_state)?;
-        }
+        // Vectorized aggregation using matmul
+        // Reshape weights to [T, 1, L] for batch matmul over all_states [T, L, D]
+        // But we have [L, T, D]. Let's transpose all_states to [T, L, D]
+        let all_states_t = all_states.transpose(0, 1)?; // [T, L, D]
+        let weights_unsz = weights.unsqueeze(1)?; // [T, 1, L]
+
+        // [T, 1, L] @ [T, L, D] -> [T, 1, D] -> [T, D]
+        let mut aggregated = weights_unsz.matmul(&all_states_t)?.squeeze(1)?;
 
         if let Some(norm) = &self.norm {
             aggregated = aggregated.apply(norm)?;
@@ -55,14 +63,13 @@ impl FullAttnRes {
 /// Partitions layers into blocks for memory efficiency.
 pub struct BlockAttnRes {
     proj: Linear,
-    block_size: usize,
 }
 
 impl BlockAttnRes {
     /// Creates a new `BlockAttnRes` instance.
-    pub fn new(dim: usize, block_size: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn new(dim: usize, _block_size: usize, vb: VarBuilder) -> Result<Self> {
         let proj = linear(dim, 1, vb.pp("proj"))?;
-        Ok(Self { proj, block_size })
+        Ok(Self { proj })
     }
 
     /// Performs the forward pass of the block attention residual block.
@@ -71,23 +78,25 @@ impl BlockAttnRes {
             return Ok(current_state.clone());
         }
 
-        // Attend over completed block representations
-        let mut states = block_outputs.to_vec();
-        states.push(current_state.clone());
+        // Combine all previous outputs in the block and the current state
+        let mut hidden_states = block_outputs.to_vec();
+        hidden_states.push(current_state.clone());
 
-        let mut weights = Vec::with_capacity(states.len());
-        for state in &states {
-            weights.push(state.apply(&self.proj)?);
+        let l = hidden_states.len();
+        let mut state_stack = Vec::with_capacity(l);
+        let mut weight_stack = Vec::with_capacity(l);
+
+        for state in &hidden_states {
+            state_stack.push(state.unsqueeze(0)?);
+            weight_stack.push(state.apply(&self.proj)?);
         }
 
-        let weights = Tensor::cat(&weights, D::Minus1)?;
-        let weights = candle_nn::ops::softmax(&weights, D::Minus1)?;
+        let all_states_t = Tensor::cat(&state_stack, 0)?.transpose(0, 1)?; // [T, L, D]
+        let weights = Tensor::cat(&weight_stack, D::Minus1)?; // [T, L]
+        let weights_unsz = candle_nn::ops::softmax(&weights, D::Minus1)?.unsqueeze(1)?; // [T, 1, L]
 
-        let mut aggregated = current_state.zeros_like()?;
-        for (i, state) in states.iter().enumerate() {
-            let w_i = weights.narrow(D::Minus1, i, 1)?;
-            aggregated = (aggregated + state.broadcast_mul(&w_i)?)?;
-        }
+        // [T, 1, L] @ [T, L, D] -> [T, 1, D] -> [T, D]
+        let aggregated = weights_unsz.matmul(&all_states_t)?.squeeze(1)?;
 
         Ok(aggregated)
     }

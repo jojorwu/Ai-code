@@ -41,16 +41,40 @@ impl TitansMemory {
         let vals = x.apply(&self.val_proj)?; // [T, D]
         let gate = ops::sigmoid(&x.apply(&self.gate_proj)?)?; // [T, D]
 
-        let mut current_m = memory_matrix.clone();
-        let (t_size, d_size) = keys.dims2()?;
-        let mut outputs = Vec::with_capacity(t_size);
-
         // Hyperparameters for the Delta-rule
         let eta = 0.1;
         let decay = 0.01;
 
         // Iteratively update memory for each token in the sequence.
         // The Delta rule update: M_t = (1 - decay) * M_{t-1} + eta * surprise_gate * ((v_t - M_{t-1}k_t) ⊗ k_t)
+        let (updated_outputs, updated_matrix) = self.update_memory_loop(
+            &keys,
+            &vals,
+            &gate,
+            memory_matrix,
+            eta,
+            decay
+        )?;
+
+        let output = Tensor::cat(&updated_outputs, 0)?;
+
+        Ok((output, updated_matrix))
+    }
+
+    /// Helper to perform iterative memory updates (Delta-rule).
+    fn update_memory_loop(
+        &self,
+        keys: &Tensor,
+        vals: &Tensor,
+        gate: &Tensor,
+        initial_matrix: &Tensor,
+        eta: f64,
+        decay: f64
+    ) -> Result<(Vec<Tensor>, Tensor)> {
+        let (t_size, d_size) = keys.dims2()?;
+        let mut current_m = initial_matrix.clone();
+        let mut outputs = Vec::with_capacity(t_size);
+
         for t in 0..t_size {
             let kt = keys.get(t)?.reshape((1, d_size))?;
             let vt = vals.get(t)?.reshape((1, d_size))?;
@@ -68,8 +92,6 @@ impl TitansMemory {
             current_m = ((current_m * (1.0 - decay))? + (update * (eta * gt))?)?;
         }
 
-        let output = Tensor::cat(&outputs, 0)?;
-
-        Ok((output, current_m))
+        Ok((outputs, current_m))
     }
 }
