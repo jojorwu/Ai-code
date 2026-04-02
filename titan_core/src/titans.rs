@@ -16,29 +16,48 @@ impl TitansMemory {
         let key_proj = linear(dim, dim, vb.pp("key_proj"))?;
         let val_proj = linear(dim, dim, vb.pp("val_proj"))?;
         let gate_proj = linear(dim, dim, vb.pp("gate_proj"))?;
-        Ok(Self { key_proj, val_proj, gate_proj, dim })
+        Ok(Self {
+            key_proj,
+            val_proj,
+            gate_proj,
+            dim,
+        })
     }
 
     pub fn forward(&self, x: &Tensor, memory_matrix: &Tensor) -> Result<(Tensor, Tensor)> {
         // x: [T, D], memory_matrix: [D, D]
         let keys = x.apply(&self.key_proj)?; // [T, D]
         let vals = x.apply(&self.val_proj)?; // [T, D]
-
-        // Compute gated updates for the matrix
         let gate = ops::sigmoid(&x.apply(&self.gate_proj)?)?; // [T, D]
-        let gate_avg = gate.mean_all()?.to_vec0::<f32>()?;
 
-        // Associative update: ΔM = sum(keys^T * vals)
-        // keys.t() is [D, T], vals is [T, D] -> update is [D, D]
-        let update = keys.t()?.matmul(&vals)?;
+        let mut current_m = memory_matrix.clone();
+        let (t_size, d_size) = keys.dims2()?;
+        let mut outputs = Vec::with_capacity(t_size);
 
-        // Update rule: M = (1 - η) * M + η * ΔM
-        let updated_memory = ((memory_matrix * ((1.0 - gate_avg) as f64))? + (&update * (gate_avg as f64))?)?;
+        // Hyperparameters for the Delta-rule
+        let eta = 0.1;
+        let decay = 0.01;
 
-        // Retrieve from memory: y = keys * M
-        // keys is [T, D], M is [D, D] -> output is [T, D]
-        let output = keys.matmul(&updated_memory)?;
+        for t in 0..t_size {
+            let kt = keys.get(t)?.reshape((1, d_size))?;
+            let vt = vals.get(t)?.reshape((1, d_size))?;
+            let gt = gate.get(t)?.mean_all()?.to_vec0::<f32>()? as f64;
 
-        Ok((output, updated_memory))
+            // Retrieve: y_t = kt * M_{t-1}
+            let yt = kt.matmul(&current_m)?;
+            outputs.push(yt.clone());
+
+            // Delta update: ΔM = (vt - yt) ⊗ kt
+            // vt - yt: [1, D], kt: [1, D] -> kt.t() @ (vt - yt): [D, D]
+            let diff = (vt - yt)?;
+            let update = kt.t()?.matmul(&diff)?;
+
+            // M_t = (1 - decay) * M_{t-1} + eta * surprise_gate * ΔM
+            current_m = ((current_m * (1.0 - decay))? + (update * (eta * gt))?)?;
+        }
+
+        let output = Tensor::cat(&outputs, 0)?;
+
+        Ok((output, current_m))
     }
 }

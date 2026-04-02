@@ -74,15 +74,20 @@ impl PyTitanTransformer {
         let device = Device::Cpu;
         let n = x_ids.len();
         if n == 0 {
-             return Ok(vec![]);
+            return Ok(vec![]);
         }
         let x = Tensor::from_vec(x_ids, Shape::from(n), &device)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
 
-        let out = self.inner.forward(&x, &mut self.memory_states, &mut self.program_states)
+        let out = self.inner
+            .forward(&x, &mut self.memory_states, &mut self.program_states)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
 
-        let flattened = out.flatten_all()
+        let (rows, cols) = out.dims2()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
+
+        let flattened = out
+            .reshape(rows * cols)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?
             .to_vec1::<f32>()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
@@ -94,14 +99,15 @@ impl PyTitanTransformer {
         let device = Device::Cpu;
         let n = x_ids.len();
         if n == 0 {
-             return Ok(0.0);
+            return Ok(0.0);
         }
         let x = Tensor::from_vec(x_ids, Shape::from(n), &device)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
         let targets = Tensor::from_vec(target_ids, Shape::from(n), &device)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
 
-        let logits = self.inner.forward(&x, &mut self.memory_states, &mut self.program_states)
+        let logits = self.inner
+            .forward(&x, &mut self.memory_states, &mut self.program_states)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
 
         let log_sm = candle_nn::ops::log_softmax(&logits, candle_core::D::Minus1)
@@ -115,7 +121,8 @@ impl PyTitanTransformer {
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
         }
 
-        let loss_val = loss.to_vec0::<f32>()
+        let loss_val = loss
+            .to_vec0::<f32>()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{}", e)))?;
 
         Ok(loss_val)
