@@ -1,5 +1,3 @@
 setuptools
 setuptools-rust
-candle-core
 tokenizers
-pyo3

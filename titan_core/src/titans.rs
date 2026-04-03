@@ -55,7 +55,10 @@ impl TitansMemory {
         let (t_size, d_size) = x.dims2()?;
 
         let mut keys = x.apply(&self.key_proj)?; // [T, D]
-        let vals = x.apply(&self.val_proj)?; // [T, D]
+        let mut vals = x.apply(&self.val_proj)?; // [T, D]
+
+        // Apply SiLU gate to values (Gated Linear Unit like capacity)
+        vals = candle_nn::ops::silu(&vals)?;
 
         // Apply RoPE to keys
         keys = rope.apply(&keys)?;

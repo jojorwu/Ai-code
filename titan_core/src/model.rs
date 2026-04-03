@@ -46,48 +46,60 @@ impl FFN {
     }
 }
 
-/// Sparse Mixture of Experts (MoE) block.
+/// Sparse Mixture of Experts (MoE) block with a Shared Expert.
 pub struct MoE {
     router: Linear,
     experts: Vec<FFN>,
+    shared_expert: FFN,
     num_experts: usize,
-    num_experts_per_tok: usize,
 }
 
 impl MoE {
-    /// Creates a new MoE block.
-    pub fn new(dim: usize, num_experts: usize, num_experts_per_tok: usize, vb: VarBuilder) -> Result<Self> {
+    /// Creates a new MoE block with a Shared Expert.
+    pub fn new(dim: usize, num_experts: usize, vb: VarBuilder) -> Result<Self> {
         let router = linear(dim, num_experts, vb.pp("router"))?;
         let mut experts = Vec::with_capacity(num_experts);
         for i in 0..num_experts {
             experts.push(FFN::new(dim, vb.pp(format!("expert_{}", i)))?);
         }
+        let shared_expert = FFN::new(dim, vb.pp("shared_expert"))?;
         Ok(Self {
             router,
             experts,
+            shared_expert,
             num_experts,
-            num_experts_per_tok,
         })
     }
 
-    /// Performs the forward pass of the MoE block with top-k routing.
+    /// Performs the forward pass of the MoE block with Top-1 routing and a Shared Expert.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (t_size, _dim) = x.dims2()?;
         let router_logits = x.apply(&self.router)?;
         let routing_weights = candle_nn::ops::softmax(&router_logits, candle_core::D::Minus1)?;
 
-        // Simple routing implementation for CPU
-        let mut final_output = x.zeros_like()?;
+        // 1. Shared Expert processes all tokens
+        let mut final_output = self.shared_expert.forward(x)?;
 
-        // Top-1 routing for simplicity (as topk is not available in standard Tensor)
-        let expert_indices = routing_weights.argmax(candle_core::D::Minus1)?;
-        let weights = routing_weights.gather(&expert_indices.unsqueeze(candle_core::D::Minus1)?, candle_core::D::Minus1)?;
+        // 2. Dynamic Experts (Top-1 routing)
+        let expert_indices = router_logits.argmax(candle_core::D::Minus1)?;
 
+        // Correct implementation for architectural demonstration:
+        // We compute all experts and mask, OR we can process subset.
+        // For standard Candle CPU, mask is robust.
         for i in 0..self.num_experts {
-             let expert_out = self.experts[i].forward(x)?;
-             // In a real MoE we'd only compute for tokens that route here.
-             // For architectural demo, we gate the full output.
-             final_output = (final_output + expert_out.broadcast_mul(&weights)?)?;
+            let expert_out = self.experts[i].forward(x)?;
+
+            // Mask: 1.0 if expert_indices == i, 0.0 otherwise
+            let mask = expert_indices.eq(i as u32)?.to_dtype(candle_core::DType::F32)?;
+            let weight = routing_weights.narrow(candle_core::D::Minus1, i, 1)?.squeeze(candle_core::D::Minus1)?;
+
+            // Combine mask and weight [T]
+            let combined_gate = mask.broadcast_mul(&weight)?;
+
+            // final_output: [T, D], expert_out: [T, D], combined_gate: [T]
+            // We need to unsqueeze combined_gate to [T, 1] for broadcasting to [T, D]
+            let combined_gate = combined_gate.unsqueeze(candle_core::D::Minus1)?;
+
+            final_output = (final_output + expert_out.broadcast_mul(&combined_gate)?)?;
         }
 
         Ok(final_output)
@@ -118,13 +130,18 @@ impl TitanTransformer {
                 memory: TitansMemory::new(dim, vb_layer.pp("memory"))?,
                 emulator: PythonEmulator::new(dim, vb_layer.pp("emulator"))?,
                 attn_res: FullAttnRes::new(dim, vb_layer.pp("attn_res"))?,
-                moe: MoE::new(dim, 4, 1, vb_layer.pp("moe"))?, // 4 experts, 1 per token
+                moe: MoE::new(dim, 4, vb_layer.pp("moe"))?, // 4 experts + shared expert
                 norm_1: rms_norm(dim, 1e-5, vb_layer.pp("norm_1"))?,
                 norm_2: rms_norm(dim, 1e-5, vb_layer.pp("norm_2"))?,
             });
         }
         let norm_final = rms_norm(dim, 1e-5, vb.pp("norm_final"))?;
-        let output = linear(dim, vocab_size, vb.pp("output"))?;
+
+        // Weight Tying: The output layer shares weights with the embedding layer
+        let output_vb = vb.pp("output");
+        let output_weights = embedding.embeddings().clone();
+        let output = Linear::new(output_weights, None); // No bias for weight tying usually
+
         Ok(Self {
             embedding,
             layers,
