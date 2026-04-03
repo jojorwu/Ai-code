@@ -37,20 +37,17 @@ impl RotaryEmbedding {
         let max_t = self.cos.dim(0)?;
 
         // Handle overflow/extrapolation by wrapping around (NTK-aware still helps)
-        let end_pos = start_pos + t_size;
 
-        let cos = if end_pos <= max_t {
-            self.cos.narrow(0, start_pos, t_size)?
+        // Ensure t_size is not greater than max_t to avoid negative narrow
+        let t_size_safe = if t_size > max_t { max_t } else { t_size };
+        let start_pos_safe = if start_pos + t_size_safe > max_t {
+            max_t - t_size_safe
         } else {
-             // Fallback to the last available positions if we exceed the pre-allocated max_seq_len
-             self.cos.narrow(0, max_t - t_size, t_size)?
-        }.narrow(1, 0, d_size)?;
+            start_pos
+        };
 
-        let sin = if end_pos <= max_t {
-            self.sin.narrow(0, start_pos, t_size)?
-        } else {
-             self.sin.narrow(0, max_t - t_size, t_size)?
-        }.narrow(1, 0, d_size)?;
+        let cos = self.cos.narrow(0, start_pos_safe, t_size_safe)?.narrow(1, 0, d_size)?;
+        let sin = self.sin.narrow(0, start_pos_safe, t_size_safe)?.narrow(1, 0, d_size)?;
 
         // x: [..., T, D], cos/sin: [T, D]
         // We need to ensure cos/sin are broadcastable to x's shape.

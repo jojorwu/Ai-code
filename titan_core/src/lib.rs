@@ -108,9 +108,26 @@ impl PyTitanTransformer {
     fn forward(&mut self, x_ids: Vec<u32>) -> PyResult<Vec<f32>> {
         let device = Device::Cpu;
         let n = x_ids.len();
+
+        // Safety guard: Prevent OOM on excessively long sequences
+        const MAX_SEQ_LEN: usize = 8192;
+        if n > MAX_SEQ_LEN {
+             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                 format!("Input sequence length {} exceeds maximum allowed length of {}", n, MAX_SEQ_LEN)
+             ));
+        }
+
         if n == 0 {
             return Ok(vec![]);
         }
+
+        // Ensure all persistent states are on the correct device and DType
+        for state in &self.memory_states {
+            if state.device().location() != device.location() || state.dtype() != DType::F32 {
+                 return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Internal state device/dtype mismatch"));
+            }
+        }
+
         let x = Tensor::from_vec(x_ids, Shape::from(n), &device).map_err(to_py_err)?;
 
         let (out, _aux_loss) = self
@@ -133,9 +150,24 @@ impl PyTitanTransformer {
     fn train_step(&mut self, x_ids: Vec<u32>, target_ids: Vec<u32>) -> PyResult<f32> {
         let device = Device::Cpu;
         let n = x_ids.len();
+
+        const MAX_SEQ_LEN: usize = 4096; // Stricter for training due to gradients
+        if n > MAX_SEQ_LEN {
+             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                 format!("Training sequence length {} exceeds maximum allowed length of {}", n, MAX_SEQ_LEN)
+             ));
+        }
+
         if n == 0 {
             return Ok(0.0);
         }
+
+        for state in &self.memory_states {
+            if state.device().location() != device.location() || state.dtype() != DType::F32 {
+                 return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Internal state device/dtype mismatch"));
+            }
+        }
+
         let x = Tensor::from_vec(x_ids, Shape::from(n), &device).map_err(to_py_err)?;
         let targets = Tensor::from_vec(target_ids, Shape::from(n), &device).map_err(to_py_err)?;
 

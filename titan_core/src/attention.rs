@@ -132,11 +132,15 @@ impl MultiHeadAttention {
     fn get_causal_mask(&self, q_len: usize, kv_len: usize, device: &candle_core::Device) -> Result<Tensor> {
         let mask: Vec<_> = (0..q_len)
             .flat_map(|i| {
-                let i_abs = i + kv_len - q_len;
+                // Safely calculate i_abs to avoid subtraction overflow
+                let i_abs = (i as i64 + kv_len as i64 - q_len as i64) as usize;
                 (0..kv_len).map(move |j| {
                     // Causal mask: j > i_abs
                     // Sliding window: j < i_abs - window_size
-                    if j > i_abs || (i_abs >= self.window_size && j < i_abs - self.window_size) {
+                    let is_causal = j > i_abs;
+                    let is_outside_window = i_abs >= self.window_size && j < i_abs - self.window_size;
+
+                    if is_causal || is_outside_window {
                          f32::NEG_INFINITY
                     } else {
                         0f32
