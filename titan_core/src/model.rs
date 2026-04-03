@@ -14,6 +14,10 @@ pub struct TitanTransformer {
     norm_final: RmsNorm,
     output: Linear,
     rope: RotaryEmbedding,
+    logit_cap: Tensor,
+    memory_tokens: Tensor,
+    block_attn_res: crate::attn_res::BlockAttnRes,
+    block_size: usize,
 }
 
 /// Feed-Forward Network (FFN) block using SwiGLU activation.
@@ -89,11 +93,17 @@ impl MoE {
             let expert_out = self.experts[i].forward(x)?;
 
             // Mask: 1.0 if expert_indices == i, 0.0 otherwise
-            let mask = expert_indices.eq(i as u32)?.to_dtype(candle_core::DType::F32)?;
+            let mask = expert_indices.eq(i as u32)?; // [T] (U8)
+
+            // routing_weights has [T, E]
             let weight = routing_weights.narrow(candle_core::D::Minus1, i, 1)?.squeeze(candle_core::D::Minus1)?;
 
             // Combine mask and weight [T]
-            let combined_gate = mask.broadcast_mul(&weight)?;
+            // Standardize both to F32 for multiplication then back to original.
+            let mask_f32 = mask.to_dtype(candle_core::DType::F32)?;
+            let weight_f32 = weight.to_dtype(candle_core::DType::F32)?;
+            let combined_gate = (mask_f32 * weight_f32)?;
+            let combined_gate = combined_gate.to_dtype(x.dtype())?;
 
             // final_output: [T, D], expert_out: [T, D], combined_gate: [T]
             // We need to unsqueeze combined_gate to [T, 1] for broadcasting to [T, D]
@@ -111,10 +121,12 @@ pub struct TitanLayer {
     pub attention: MultiHeadAttention,
     pub memory: TitansMemory,
     pub emulator: PythonEmulator,
-    pub attn_res: FullAttnRes,
     pub moe: MoE,
     pub norm_1: RmsNorm,
     pub norm_2: RmsNorm,
+    pub branch_gates: Tensor,
+    pub layerscale_1: Tensor,
+    pub layerscale_2: Tensor,
 }
 
 impl TitanTransformer {
@@ -123,19 +135,25 @@ impl TitanTransformer {
         let embedding = embedding(vocab_size, dim, vb.pp("embedding"))?;
         let rope = RotaryEmbedding::new(dim, 2048, vb.device())?;
         let mut layers = Vec::with_capacity(num_layers);
+        let block_size = 4;
         for i in 0..num_layers {
             let vb_layer = vb.pp(format!("layer_{}", i));
             layers.push(TitanLayer {
                 attention: MultiHeadAttention::new(dim, 8, 2, vb_layer.pp("attention"))?, // GQA with 2 KV heads
                 memory: TitansMemory::new(dim, vb_layer.pp("memory"))?,
                 emulator: PythonEmulator::new(dim, vb_layer.pp("emulator"))?,
-                attn_res: FullAttnRes::new(dim, vb_layer.pp("attn_res"))?,
                 moe: MoE::new(dim, 4, vb_layer.pp("moe"))?, // 4 experts + shared expert
                 norm_1: rms_norm(dim, 1e-5, vb_layer.pp("norm_1"))?,
                 norm_2: rms_norm(dim, 1e-5, vb_layer.pp("norm_2"))?,
+                branch_gates: vb_layer.get((3,), "branch_gates")?,
+                layerscale_1: vb_layer.get((dim,), "layerscale_1")?,
+                layerscale_2: vb_layer.get((dim,), "layerscale_2")?,
             });
         }
         let norm_final = rms_norm(dim, 1e-5, vb.pp("norm_final"))?;
+        let logit_cap = vb.get((1,), "logit_cap")?;
+        let memory_tokens = vb.get((8, dim), "memory_tokens")?; // 8 persistent memory tokens
+        let block_attn_res = crate::attn_res::BlockAttnRes::new(dim, vb.pp("block_attn_res"))?;
 
         // Weight Tying: The output layer shares weights with the embedding layer
         let output_vb = vb.pp("output");
@@ -148,6 +166,10 @@ impl TitanTransformer {
             norm_final,
             output,
             rope,
+            logit_cap,
+            memory_tokens,
+            block_attn_res,
+            block_size,
         })
     }
 
@@ -160,8 +182,19 @@ impl TitanTransformer {
         kv_caches: &mut [Option<(Tensor, Tensor)>],
     ) -> Result<Tensor> {
         let mut h = x.apply(&self.embedding)?;
-        let mut layer_outputs = Vec::with_capacity(self.layers.len() + 1);
-        layer_outputs.push(h.clone());
+        let dtype = h.dtype();
+        let device = h.device();
+
+        // Detect if we are in incremental generation mode (using KV-cache)
+        let is_incremental = kv_caches.iter().any(|c| c.is_some());
+
+        // Prepend persistent memory tokens ONLY if we are at the start of a sequence
+        if !is_incremental {
+             h = Tensor::cat(&[&self.memory_tokens, &h], 0)?;
+        }
+
+        let mut local_history = Vec::with_capacity(self.block_size);
+        let mut block_summaries = Vec::with_capacity(self.layers.len() / self.block_size + 1);
 
         for (i, layer) in self.layers.iter().enumerate() {
             // Parallel Block Architecture:
@@ -182,21 +215,54 @@ impl TitanTransformer {
             let new_prog = layer.emulator.step(&h_quantized, &program_states[i])?;
             program_states[i] = new_prog.clone();
 
-            // Aggregate parallel components
-            let mut parallel_out = (attn_out + mem_out)?;
-            parallel_out = parallel_out.broadcast_add(&new_prog)?;
+            // Aggregate parallel components with learnable gating (vectorized)
+            let gates = candle_nn::ops::softmax(&layer.branch_gates, 0)?;
+            let g_attn = gates.narrow(0, 0, 1)?;
+            let g_mem = gates.narrow(0, 1, 1)?;
+            let g_emu = gates.narrow(0, 2, 1)?;
 
-            // 4. Attention Residuals (Long-term cross-layer aggregation)
-            layer_outputs.push(parallel_out.clone());
-            let attn_res_out = layer.attn_res.forward(&layer_outputs, &self.rope)?;
+            let mut parallel_out = attn_out.broadcast_mul(&g_attn)?;
+            parallel_out = (parallel_out + mem_out.broadcast_mul(&g_mem)?)?;
+            parallel_out = (parallel_out.broadcast_add(&new_prog.broadcast_mul(&g_emu)?))?;
 
-            h = (h + attn_res_out)?;
+            // 4. Block Attention Residuals
+            let attn_res_out = self.block_attn_res.forward(&block_summaries, &parallel_out, &self.rope)?;
+
+            h = (h + attn_res_out.broadcast_mul(&layer.layerscale_1)?)?;
 
             // Sequential Block: MoE Feed-Forward
             let h_ffn_norm = h.apply(&layer.norm_2)?;
-            h = (h + layer.moe.forward(&h_ffn_norm)?)?;
+            let moe_out = layer.moe.forward(&h_ffn_norm)?;
+            h = (h + moe_out.broadcast_mul(&layer.layerscale_2)?)?;
+
+            // Manage history for Block Attention Residuals
+            local_history.push(h.clone());
+            if local_history.len() == self.block_size {
+                 // Block completed: summarize block (e.g. mean of local history)
+                 let block_summary = (Tensor::stack(&local_history, 0)?.mean(0))?;
+                 block_summaries.push(block_summary);
+                 local_history.clear();
+            }
         }
 
-        h.apply(&self.norm_final)?.apply(&self.output)
+        let h = h.apply(&self.norm_final)?;
+
+        // Skip memory tokens for output projection
+        let m_size = self.memory_tokens.dim(0)?;
+        let total_size = h.dim(0)?;
+        let h_output = if total_size > m_size {
+             h.narrow(0, m_size, total_size - m_size)?
+        } else {
+             h
+        };
+
+        let logits = h_output.apply(&self.output)?;
+
+        // Learnable Logit Softcapping (vectorized)
+        // softplus: ln(1 + exp(x))
+        let cap = (self.logit_cap.exp()?.affine(1.0, 1.0)?.log()? + 1.0)?;
+
+        let softcapped = logits.broadcast_div(&cap)?.tanh()?;
+        softcapped.broadcast_mul(&cap)
     }
 }

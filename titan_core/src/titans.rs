@@ -69,9 +69,9 @@ impl TitansMemory {
         let vals = vals.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?; // [H, T, Hd]
         let gate = gate.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?; // [H, T, Hd]
 
-        // Hyperparameters for the Delta-rule (learnable)
-        let eta = ops::sigmoid(&self.eta)?.flatten_all()?.to_vec1::<f32>()?[0] as f64 * 0.5; // Scale to [0, 0.5]
-        let decay = ops::sigmoid(&self.decay)?.flatten_all()?.to_vec1::<f32>()?[0] as f64 * 0.1; // Scale to [0, 0.1]
+        // Hyperparameters for the Delta-rule (learnable, vectorized)
+        let eta = (ops::sigmoid(&self.eta)? * 0.5)?;
+        let decay = (ops::sigmoid(&self.decay)? * 0.1)?;
 
         let mut new_m_list = Vec::with_capacity(self.num_heads);
         let mut final_head_outputs = Vec::with_capacity(self.num_heads);
@@ -83,7 +83,7 @@ impl TitansMemory {
             let gh = gate.get(h)?; // [T, Hd]
             let mh = memory_matrices.get(h)?; // [Hd, Hd]
 
-            let (y_h, m_h_new) = self.update_memory_loop(&kh, &vh, &gh, &mh, eta, decay)?;
+            let (y_h, m_h_new) = self.update_memory_loop(&kh, &vh, &gh, &mh, &eta, &decay)?;
 
             final_head_outputs.push(y_h.unsqueeze(1)?); // [T, 1, Hd]
             new_m_list.push(m_h_new.unsqueeze(0)?); // [1, Hd, Hd]
@@ -104,17 +104,19 @@ impl TitansMemory {
         vals: &Tensor,
         gate: &Tensor,
         initial_matrix: &Tensor,
-        eta: f64,
-        decay: f64,
+        eta: &Tensor,
+        decay: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
         let (t_size, hd_size) = keys.dims2()?;
         let mut current_m = initial_matrix.clone();
         let mut outputs = Vec::with_capacity(t_size);
 
+        let one_minus_decay = (decay.neg()?.affine(1.0, 1.0))?;
+
         for t in 0..t_size {
             let kt = keys.get(t)?.reshape((1, hd_size))?;
             let vt = vals.get(t)?.reshape((1, hd_size))?;
-            let gt = gate.get(t)?.mean_all()?.to_vec0::<f32>()? as f64;
+            let gt = gate.get(t)?.mean_all()?;
 
             // y_t = k_t * M_{t-1}
             let yt = kt.matmul(&current_m)?;
@@ -125,7 +127,8 @@ impl TitansMemory {
             let update = kt.t()?.matmul(&diff)?;
 
             // M_t = (1 - decay) * M_{t-1} + eta * surprise_gate * ΔM
-            current_m = ((current_m * (1.0 - decay))? + (update * (eta * gt))?)?;
+            let gated_eta = (eta.broadcast_mul(&gt))?;
+            current_m = (current_m.broadcast_mul(&one_minus_decay)?.broadcast_add(&update.broadcast_mul(&gated_eta)?)?);
         }
 
         let output = Tensor::cat(&outputs, 0)?;

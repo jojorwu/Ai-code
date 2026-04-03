@@ -1,5 +1,5 @@
 use candle_core::{D, Result, Tensor};
-use candle_nn::{linear, Linear, VarBuilder};
+use candle_nn::{linear, rms_norm, Linear, RmsNorm, VarBuilder};
 use crate::rope::RotaryEmbedding;
 
 pub struct MultiHeadAttention {
@@ -7,6 +7,8 @@ pub struct MultiHeadAttention {
     k_proj: Linear,
     v_proj: Linear,
     out_proj: Linear,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -20,11 +22,16 @@ impl MultiHeadAttention {
         let v_proj = linear(dim, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let out_proj = linear(dim, dim, vb.pp("out_proj"))?;
 
+        let q_norm = rms_norm(head_dim, 1e-5, vb.pp("q_norm"))?;
+        let k_norm = rms_norm(head_dim, 1e-5, vb.pp("k_norm"))?;
+
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             out_proj,
+            q_norm,
+            k_norm,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -45,8 +52,12 @@ impl MultiHeadAttention {
 
         // Reshape for GQA: q: [H, T, Hd], k/v: [Hkv, T, Hd]
         let q = q.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?;
-        let mut k = k.reshape((t_size, self.num_kv_heads, self.head_dim))?.transpose(0, 1)?;
+        let k = k.reshape((t_size, self.num_kv_heads, self.head_dim))?.transpose(0, 1)?;
         let mut v = v.reshape((t_size, self.num_kv_heads, self.head_dim))?.transpose(0, 1)?;
+
+        // Apply QK Norm (improved training stability)
+        let q = q.apply(&self.q_norm)?;
+        let mut k = k.apply(&self.k_norm)?;
 
         // Apply RoPE
         let q = rope.apply(&q)?;

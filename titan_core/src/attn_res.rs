@@ -5,54 +5,65 @@ use crate::rope::RotaryEmbedding;
 /// Full Attention Residuals.
 /// Aggregates all previous layer outputs using a learned pseudo-attention mechanism.
 pub struct FullAttnRes {
-    proj: Linear,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    out_proj: Linear,
     norm: Option<RmsNorm>,
 }
 
 impl FullAttnRes {
-    /// Creates a new `FullAttnRes` instance.
+    /// Creates a new `FullAttnRes` instance with cross-attention logic.
     pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let proj = linear(dim, 1, vb.pp("proj"))?; // Pseudo-query projection
+        let q_proj = linear(dim, dim, vb.pp("q_proj"))?;
+        let k_proj = linear(dim, dim, vb.pp("k_proj"))?;
+        let v_proj = linear(dim, dim, vb.pp("v_proj"))?;
+        let out_proj = linear(dim, dim, vb.pp("out_proj"))?;
         let norm = rms_norm(dim, 1e-5, vb.pp("norm")).ok();
-        Ok(Self { proj, norm })
+        Ok(Self { q_proj, k_proj, v_proj, out_proj, norm })
     }
 
-    /// Performs the forward pass of the attention residual block.
+    /// Performs the forward pass using the last hidden state as a query over all previous states.
     pub fn forward(&self, hidden_states: &[Tensor], rope: &RotaryEmbedding) -> Result<Tensor> {
         if hidden_states.is_empty() {
             candle_core::bail!("hidden_states cannot be empty");
         }
 
         let l = hidden_states.len();
+        let query_state = &hidden_states[l - 1]; // [T, D]
 
-        // Compute attention weights over all previous layers
-        // hidden_states is Vec<[T, D]>
-        let mut state_stack = Vec::with_capacity(l);
-        let mut weight_stack = Vec::with_capacity(l);
+        // 1. Prepare Query
+        let q = query_state.apply(&self.q_proj)?;
+        let q = rope.apply(&q)?; // [T, D]
+
+        // 2. Prepare Keys and Values from all layers
+        let mut k_stack = Vec::with_capacity(l);
+        let mut v_stack = Vec::with_capacity(l);
+
         for state in hidden_states {
-            // Apply RoPE to the state before computing weights
-            let state_rope = rope.apply(state)?;
-            // [T, D] -> [1, T, D]
-            state_stack.push(state.unsqueeze(0)?);
-            // [T, D] -> [T, 1]
-            weight_stack.push(state_rope.apply(&self.proj)?);
+            let k = state.apply(&self.k_proj)?;
+            let v = state.apply(&self.v_proj)?;
+
+            k_stack.push(rope.apply(&k)?.unsqueeze(0)?); // [1, T, D]
+            v_stack.push(v.unsqueeze(0)?); // [1, T, D]
         }
 
-        // Stack all previous states: [L, T, D]
-        let all_states = Tensor::cat(&state_stack, 0)?;
-        // Concatenate weights: [T, L]
-        let weights = Tensor::cat(&weight_stack, D::Minus1)?;
-        // Normalize weights over layers: [T, L]
-        let weights = candle_nn::ops::softmax(&weights, D::Minus1)?;
+        let k_all = Tensor::cat(&k_stack, 0)?; // [L, T, D]
+        let v_all = Tensor::cat(&v_stack, 0)?; // [L, T, D]
 
-        // Vectorized aggregation using matmul
-        // Reshape weights to [T, 1, L] for batch matmul over all_states [T, L, D]
-        // But we have [L, T, D]. Let's transpose all_states to [T, L, D]
-        let all_states_t = all_states.transpose(0, 1)?; // [T, L, D]
-        let weights_unsz = weights.unsqueeze(1)?; // [T, 1, L]
+        // Transpose for cross-attention over layers per token
+        let k_all = k_all.transpose(0, 1)?; // [T, L, D]
+        let v_all = v_all.transpose(0, 1)?; // [T, L, D]
 
-        // [T, 1, L] @ [T, L, D] -> [T, 1, D] -> [T, D]
-        let mut aggregated = weights_unsz.matmul(&all_states_t)?.squeeze(1)?;
+        // 3. Attention calculation [T, 1, D] @ [T, D, L] -> [T, 1, L]
+        let q = q.unsqueeze(1)?; // [T, 1, D]
+        let scale = (q.dim(D::Minus1)? as f64).sqrt();
+        let scores = (q.matmul(&k_all.transpose(1, 2)?)? / scale)?;
+        let attn = candle_nn::ops::softmax(&scores, D::Minus1)?; // [T, 1, L]
+
+        // 4. Aggregate [T, 1, L] @ [T, L, D] -> [T, 1, D]
+        let context = attn.matmul(&v_all)?.squeeze(1)?; // [T, D]
+        let mut aggregated = context.apply(&self.out_proj)?;
 
         if let Some(norm) = &self.norm {
             aggregated = aggregated.apply(norm)?;
@@ -63,44 +74,55 @@ impl FullAttnRes {
 }
 
 /// Block Attention Residuals.
-/// Partitions layers into blocks for memory efficiency.
+/// Aggregates outputs from completed blocks and current local states.
 pub struct BlockAttnRes {
-    proj: Linear,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    out_proj: Linear,
 }
 
 impl BlockAttnRes {
-    /// Creates a new `BlockAttnRes` instance.
-    pub fn new(dim: usize, _block_size: usize, vb: VarBuilder) -> Result<Self> {
-        let proj = linear(dim, 1, vb.pp("proj"))?;
-        Ok(Self { proj })
+    /// Creates a new `BlockAttnRes` instance with cross-attention logic.
+    pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
+        let q_proj = linear(dim, dim, vb.pp("q_proj"))?;
+        let k_proj = linear(dim, dim, vb.pp("k_proj"))?;
+        let v_proj = linear(dim, dim, vb.pp("v_proj"))?;
+        let out_proj = linear(dim, dim, vb.pp("out_proj"))?;
+        Ok(Self { q_proj, k_proj, v_proj, out_proj })
     }
 
-    /// Performs the forward pass of the block attention residual block.
-    pub fn forward(&self, block_outputs: &[Tensor], current_state: &Tensor) -> Result<Tensor> {
-        if block_outputs.is_empty() {
-            return Ok(current_state.clone());
+    /// Performs the forward pass using cross-attention over block outputs.
+    pub fn forward(&self, states: &[Tensor], current: &Tensor, rope: &RotaryEmbedding) -> Result<Tensor> {
+        if states.is_empty() {
+            return Ok(current.clone());
         }
 
-        // Combine all previous outputs in the block and the current state
-        let mut hidden_states = block_outputs.to_vec();
-        hidden_states.push(current_state.clone());
+        let mut all_history = states.to_vec();
+        all_history.push(current.clone());
+        let l = all_history.len();
 
-        let l = hidden_states.len();
-        let mut state_stack = Vec::with_capacity(l);
-        let mut weight_stack = Vec::with_capacity(l);
+        let q = current.apply(&self.q_proj)?;
+        let q = rope.apply(&q)?.unsqueeze(1)?; // [T, 1, D]
 
-        for state in &hidden_states {
-            state_stack.push(state.unsqueeze(0)?);
-            weight_stack.push(state.apply(&self.proj)?);
+        let mut k_stack = Vec::with_capacity(l);
+        let mut v_stack = Vec::with_capacity(l);
+
+        for state in &all_history {
+            let k = state.apply(&self.k_proj)?;
+            let v = state.apply(&self.v_proj)?;
+            k_stack.push(rope.apply(&k)?.unsqueeze(0)?);
+            v_stack.push(v.unsqueeze(0)?);
         }
 
-        let all_states_t = Tensor::cat(&state_stack, 0)?.transpose(0, 1)?; // [T, L, D]
-        let weights = Tensor::cat(&weight_stack, D::Minus1)?; // [T, L]
-        let weights_unsz = candle_nn::ops::softmax(&weights, D::Minus1)?.unsqueeze(1)?; // [T, 1, L]
+        let k_all = Tensor::cat(&k_stack, 0)?.transpose(0, 1)?; // [T, L, D]
+        let v_all = Tensor::cat(&v_stack, 0)?.transpose(0, 1)?; // [T, L, D]
 
-        // [T, 1, L] @ [T, L, D] -> [T, 1, D] -> [T, D]
-        let aggregated = weights_unsz.matmul(&all_states_t)?.squeeze(1)?;
+        let scale = (q.dim(D::Minus1)? as f64).sqrt();
+        let scores = (q.matmul(&k_all.transpose(1, 2)?)? / scale)?;
+        let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
 
-        Ok(aggregated)
+        let context = attn.matmul(&v_all)?.squeeze(1)?;
+        context.apply(&self.out_proj)
     }
 }
