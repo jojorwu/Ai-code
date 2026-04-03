@@ -45,7 +45,7 @@ import titan_core as titan
 vocab_size = 1000
 dim = 256
 num_layers = 4
-model = titan.PyTitanTransformer(vocab_size, dim, num_layers)
+model = titan.TitanTransformer(vocab_size, dim, num_layers)
 
 # Forward pass
 input_ids = [1, 2, 3, 4, 5]

@@ -1,0 +1,48 @@
+from typing import List, Optional
+from ._titan_core import PyTitanTransformer, PyTokenizer
+
+class TitanTransformer:
+    """
+    High-level wrapper for the Titan model.
+    """
+    def __init__(self, vocab_size: int, dim: int, num_layers: int):
+        self._inner = PyTitanTransformer(vocab_size, dim, num_layers)
+
+    def init_optimizer(self, lr: float) -> None:
+        """Initializes the AdamW optimizer with the given learning rate."""
+        self._inner.init_optimizer(lr)
+
+    def save_weights(self, path: str) -> None:
+        """Saves model weights to a .safetensors file."""
+        self._inner.save_weights(path)
+
+    def load_weights(self, path: str) -> None:
+        """Loads model weights from a .safetensors file."""
+        self._inner.load_weights(path)
+
+    def reset_state(self) -> None:
+        """Resets the internal long-term memory and program state."""
+        self._inner.reset_state()
+
+    def forward(self, input_ids: List[int]) -> List[float]:
+        """Performs a forward pass given a list of input token IDs."""
+        return self._inner.forward(input_ids)
+
+    def train_step(self, input_ids: List[int], target_ids: List[int]) -> float:
+        """Performs a single training step and returns the loss."""
+        return self._inner.train_step(input_ids, target_ids)
+
+class Tokenizer:
+    """
+    High-level wrapper for the project tokenizer.
+    """
+    def __init__(self, json_path: str):
+        self._inner = PyTokenizer(json_path)
+
+    def encode(self, text: str) -> List[int]:
+        """Encodes text into a list of token IDs."""
+        return self._inner.encode(text)
+
+    def decode(self, ids: List[int]) -> str:
+        """Decodes a list of token IDs into text."""
+        return self._inner.decode(ids)

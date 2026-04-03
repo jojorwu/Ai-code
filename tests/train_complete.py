@@ -1,13 +1,4 @@
-import sys
-import os
-
-# Ensure the .so can be found
-sys.path.append(os.path.join(os.getcwd(), "titan_core"))
-
-try:
-    import titan_core as titan
-except ImportError:
-    import titan_core.titan_core as titan
+import titan_py as titan
 
 def train_complete_demo():
     print("Titan Complete Training Demo")
@@ -15,7 +6,7 @@ def train_complete_demo():
     dim = 64
     num_layers = 2
 
-    model = titan.PyTitanTransformer(vocab_size, dim, num_layers)
+    model = titan.TitanTransformer(vocab_size, dim, num_layers)
     model.init_optimizer(lr=1e-3)
 
     # Dummy dataset: predict next character
@@ -35,7 +26,7 @@ def train_complete_demo():
     model.save_weights(weights_path)
 
     print("Loading weights into a new model...")
-    new_model = titan.PyTitanTransformer(vocab_size, dim, num_layers)
+    new_model = titan.TitanTransformer(vocab_size, dim, num_layers)
     new_model.load_weights(weights_path)
 
     print("Training demo complete.")

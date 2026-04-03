@@ -16,6 +16,7 @@ fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
 }
 
 #[pyclass]
+#[doc = "Rust-based implementation of the Titan Transformer model."]
 pub struct PyTitanTransformer {
     inner: TitanTransformer,
     varmap: VarMap,
@@ -29,6 +30,7 @@ pub struct PyTitanTransformer {
 #[pymethods]
 impl PyTitanTransformer {
     #[new]
+    #[doc = "Initializes a new Titan Transformer with the given vocabulary size, dimension, and number of layers."]
     fn new(vocab_size: usize, dim: usize, num_layers: usize) -> PyResult<Self> {
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -55,6 +57,7 @@ impl PyTitanTransformer {
         })
     }
 
+    #[doc = "Initializes the AdamW optimizer with a specific learning rate."]
     fn init_optimizer(&mut self, lr: f64) -> PyResult<()> {
         let params = ParamsAdamW {
             lr,
@@ -65,16 +68,19 @@ impl PyTitanTransformer {
         Ok(())
     }
 
+    #[doc = "Saves the model weights to the specified path in .safetensors format."]
     fn save_weights(&self, path: String) -> PyResult<()> {
         self.varmap.save(path).map_err(to_py_err)?;
         Ok(())
     }
 
+    #[doc = "Loads the model weights from the specified .safetensors path."]
     fn load_weights(&mut self, path: String) -> PyResult<()> {
         self.varmap.load(path).map_err(to_py_err)?;
         Ok(())
     }
 
+    #[doc = "Resets the persistent internal long-term memory and program states to zero."]
     fn reset_state(&mut self) -> PyResult<()> {
         let device = Device::Cpu;
         for i in 0..self.num_layers {
@@ -86,6 +92,7 @@ impl PyTitanTransformer {
         Ok(())
     }
 
+    #[doc = "Performs a forward pass on a sequence of token IDs and returns the logits for each token."]
     fn forward(&mut self, x_ids: Vec<u32>) -> PyResult<Vec<f32>> {
         let device = Device::Cpu;
         let n = x_ids.len();
@@ -110,6 +117,7 @@ impl PyTitanTransformer {
         Ok(flattened)
     }
 
+    #[doc = "Executes a single training step (forward pass, loss calculation, and backpropagation) and returns the loss value."]
     fn train_step(&mut self, x_ids: Vec<u32>, target_ids: Vec<u32>) -> PyResult<f32> {
         let device = Device::Cpu;
         let n = x_ids.len();
@@ -139,6 +147,7 @@ impl PyTitanTransformer {
 }
 
 #[pyclass]
+#[doc = "A wrapper around the tokenizers library for text encoding and decoding."]
 pub struct PyTokenizer {
     inner: Tokenizer,
 }
@@ -146,16 +155,19 @@ pub struct PyTokenizer {
 #[pymethods]
 impl PyTokenizer {
     #[new]
+    #[doc = "Loads a tokenizer from a JSON configuration file."]
     fn new(json_path: String) -> PyResult<Self> {
         let inner = Tokenizer::from_file(json_path).map_err(to_py_err)?;
         Ok(Self { inner })
     }
 
+    #[doc = "Encodes a string of text into a list of token IDs."]
     fn encode(&self, text: String) -> PyResult<Vec<u32>> {
         let encoding = self.inner.encode(text, true).map_err(to_py_err)?;
         Ok(encoding.get_ids().to_vec())
     }
 
+    #[doc = "Decodes a list of token IDs back into a human-readable string."]
     fn decode(&self, ids: Vec<u32>) -> PyResult<String> {
         let text = self.inner.decode(&ids, true).map_err(to_py_err)?;
         Ok(text)
@@ -163,7 +175,7 @@ impl PyTokenizer {
 }
 
 #[pymodule]
-fn titan_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _titan_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTitanTransformer>()?;
     m.add_class::<PyTokenizer>()?;
     Ok(())
