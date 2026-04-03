@@ -1,5 +1,6 @@
 use candle_core::{Tensor, Result, D};
 use candle_nn::{VarBuilder, linear, Linear, rms_norm, RmsNorm};
+use crate::rope::RotaryEmbedding;
 
 /// Full Attention Residuals.
 /// Aggregates all previous layer outputs using a learned pseudo-attention mechanism.
@@ -17,7 +18,7 @@ impl FullAttnRes {
     }
 
     /// Performs the forward pass of the attention residual block.
-    pub fn forward(&self, hidden_states: &[Tensor]) -> Result<Tensor> {
+    pub fn forward(&self, hidden_states: &[Tensor], rope: &RotaryEmbedding) -> Result<Tensor> {
         if hidden_states.is_empty() {
             candle_core::bail!("hidden_states cannot be empty");
         }
@@ -29,10 +30,12 @@ impl FullAttnRes {
         let mut state_stack = Vec::with_capacity(l);
         let mut weight_stack = Vec::with_capacity(l);
         for state in hidden_states {
+            // Apply RoPE to the state before computing weights
+            let state_rope = rope.apply(state)?;
             // [T, D] -> [1, T, D]
             state_stack.push(state.unsqueeze(0)?);
             // [T, D] -> [T, 1]
-            weight_stack.push(state.apply(&self.proj)?);
+            weight_stack.push(state_rope.apply(&self.proj)?);
         }
 
         // Stack all previous states: [L, T, D]

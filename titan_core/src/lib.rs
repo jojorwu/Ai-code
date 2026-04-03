@@ -2,6 +2,8 @@ pub mod attn_res;
 pub mod titans;
 pub mod quant;
 pub mod emulator;
+pub mod rope;
+pub mod attention;
 pub mod model;
 
 use candle_core::{Device, Tensor, DType, Shape};
@@ -39,10 +41,13 @@ impl PyTitanTransformer {
         let inner = TitanTransformer::new(vocab_size, dim, num_layers, vb).map_err(to_py_err)?;
 
         // Initialize states
+        let num_heads = 8;
+        let head_dim = dim / num_heads;
         let mut memory_states = Vec::with_capacity(num_layers);
         let mut program_states = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            memory_states.push(Tensor::zeros((dim, dim), DType::F32, &device).map_err(to_py_err)?);
+            // Multi-head memory state [H, Hd, Hd]
+            memory_states.push(Tensor::zeros((num_heads, head_dim, head_dim), DType::F32, &device).map_err(to_py_err)?);
             program_states.push(Tensor::zeros((1, dim), DType::F32, &device).map_err(to_py_err)?);
         }
 
@@ -83,9 +88,11 @@ impl PyTitanTransformer {
     #[doc = "Resets the persistent internal long-term memory and program states to zero."]
     fn reset_state(&mut self) -> PyResult<()> {
         let device = Device::Cpu;
+        let num_heads = 8;
+        let head_dim = self.dim / num_heads;
         for i in 0..self.num_layers {
             self.memory_states[i] =
-                Tensor::zeros((self.dim, self.dim), DType::F32, &device).map_err(to_py_err)?;
+                Tensor::zeros((num_heads, head_dim, head_dim), DType::F32, &device).map_err(to_py_err)?;
             self.program_states[i] =
                 Tensor::zeros((1, self.dim), DType::F32, &device).map_err(to_py_err)?;
         }

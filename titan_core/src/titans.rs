@@ -1,5 +1,6 @@
 use candle_core::{Tensor, Result};
 use candle_nn::{VarBuilder, linear, Linear, ops};
+use crate::rope::RotaryEmbedding;
 
 /// Titans Long-Term Memory (Neural Memory).
 ///
@@ -10,58 +11,82 @@ pub struct TitansMemory {
     key_proj: Linear,
     val_proj: Linear,
     gate_proj: Linear,
+    out_proj: Linear,
+    num_heads: usize,
+    head_dim: usize,
 }
 
 impl TitansMemory {
     /// Creates a new `TitansMemory` instance.
     pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
+        let num_heads = 8; // Default to 8 heads
+        let head_dim = dim / num_heads;
+
         let key_proj = linear(dim, dim, vb.pp("key_proj"))?;
         let val_proj = linear(dim, dim, vb.pp("val_proj"))?;
         let gate_proj = linear(dim, dim, vb.pp("gate_proj"))?;
+        let out_proj = linear(dim, dim, vb.pp("out_proj"))?;
+
         Ok(Self {
             key_proj,
             val_proj,
             gate_proj,
+            out_proj,
+            num_heads,
+            head_dim,
         })
     }
 
     /// Performs the forward pass of the memory module.
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor of shape `[T, D]`.
-    /// * `memory_matrix` - The current persistent memory state of shape `[D, D]`.
-    ///
-    /// # Returns
-    /// A tuple containing:
-    /// 1. The retrieved values from memory of shape `[T, D]`.
-    /// 2. The updated memory matrix of shape `[D, D]`.
-    pub fn forward(&self, x: &Tensor, memory_matrix: &Tensor) -> Result<(Tensor, Tensor)> {
-        // x: [T, D], memory_matrix: [D, D]
-        let keys = x.apply(&self.key_proj)?; // [T, D]
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        memory_matrices: &Tensor,
+        rope: &RotaryEmbedding
+    ) -> Result<(Tensor, Tensor)> {
+        // x: [T, D], memory_matrices: [H, Hd, Hd]
+        let (t_size, d_size) = x.dims2()?;
+
+        let mut keys = x.apply(&self.key_proj)?; // [T, D]
         let vals = x.apply(&self.val_proj)?; // [T, D]
+
+        // Apply RoPE to keys
+        keys = rope.apply(&keys)?;
         let gate = ops::sigmoid(&x.apply(&self.gate_proj)?)?; // [T, D]
 
-        // Hyperparameters for the Delta-rule
+        // Reshape for multi-head: [T, H, Hd]
+        let keys = keys.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?; // [H, T, Hd]
+        let vals = vals.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?; // [H, T, Hd]
+        let gate = gate.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?; // [H, T, Hd]
+
         let eta = 0.1;
         let decay = 0.01;
 
-        // Iteratively update memory for each token in the sequence.
-        // The Delta rule update: M_t = (1 - decay) * M_{t-1} + eta * surprise_gate * ((v_t - M_{t-1}k_t) ⊗ k_t)
-        let (updated_outputs, updated_matrix) = self.update_memory_loop(
-            &keys,
-            &vals,
-            &gate,
-            memory_matrix,
-            eta,
-            decay
-        )?;
+        let mut new_m_list = Vec::with_capacity(self.num_heads);
+        let mut final_head_outputs = Vec::with_capacity(self.num_heads);
 
-        let output = Tensor::cat(&updated_outputs, 0)?;
+        // Process each head in parallel (recurrent within each head)
+        for h in 0..self.num_heads {
+            let kh = keys.get(h)?; // [T, Hd]
+            let vh = vals.get(h)?; // [T, Hd]
+            let gh = gate.get(h)?; // [T, Hd]
+            let mh = memory_matrices.get(h)?; // [Hd, Hd]
 
-        Ok((output, updated_matrix))
+            let (y_h, m_h_new) = self.update_memory_loop(&kh, &vh, &gh, &mh, eta, decay)?;
+
+            final_head_outputs.push(y_h.unsqueeze(1)?); // [T, 1, Hd]
+            new_m_list.push(m_h_new.unsqueeze(0)?); // [1, Hd, Hd]
+        }
+
+        let output = Tensor::cat(&final_head_outputs, 1)?; // [T, H, Hd]
+        let output = output.reshape((t_size, d_size))?.apply(&self.out_proj)?;
+
+        let updated_memory = Tensor::cat(&new_m_list, 0)?; // [H, Hd, Hd]
+
+        Ok((output, updated_memory))
     }
 
-    /// Helper to perform iterative memory updates (Delta-rule).
+    /// Helper to perform iterative memory updates (Delta-rule) for a single head.
     fn update_memory_loop(
         &self,
         keys: &Tensor,
@@ -69,29 +94,30 @@ impl TitansMemory {
         gate: &Tensor,
         initial_matrix: &Tensor,
         eta: f64,
-        decay: f64
-    ) -> Result<(Vec<Tensor>, Tensor)> {
-        let (t_size, d_size) = keys.dims2()?;
+        decay: f64,
+    ) -> Result<(Tensor, Tensor)> {
+        let (t_size, hd_size) = keys.dims2()?;
         let mut current_m = initial_matrix.clone();
         let mut outputs = Vec::with_capacity(t_size);
 
         for t in 0..t_size {
-            let kt = keys.get(t)?.reshape((1, d_size))?;
-            let vt = vals.get(t)?.reshape((1, d_size))?;
+            let kt = keys.get(t)?.reshape((1, hd_size))?;
+            let vt = vals.get(t)?.reshape((1, hd_size))?;
             let gt = gate.get(t)?.mean_all()?.to_vec0::<f32>()? as f64;
 
-            // Retrieve from current state: y_t = k_t * M_{t-1}
+            // y_t = k_t * M_{t-1}
             let yt = kt.matmul(&current_m)?;
             outputs.push(yt.clone());
 
-            // Compute the error/surprise (v_t - y_t) and the outer product with k_t
+            // ΔM = (v_t - y_t) ⊗ k_t
             let diff = (vt - yt)?;
             let update = kt.t()?.matmul(&diff)?;
 
-            // Update M with gated delta and decay
+            // M_t = (1 - decay) * M_{t-1} + eta * surprise_gate * ΔM
             current_m = ((current_m * (1.0 - decay))? + (update * (eta * gt))?)?;
         }
 
-        Ok((outputs, current_m))
+        let output = Tensor::cat(&outputs, 0)?;
+        Ok((output, current_m))
     }
 }
