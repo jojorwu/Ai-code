@@ -155,13 +155,14 @@ impl TitanTransformer {
     /// Creates a new Titan Transformer model.
     pub fn new(vocab_size: usize, dim: usize, num_layers: usize, vb: VarBuilder) -> Result<Self> {
         let embedding = embedding(vocab_size, dim, vb.pp("embedding"))?;
-        let rope = RotaryEmbedding::new(dim, 2048, vb.device())?;
+        let rope = RotaryEmbedding::new(dim, 8192, vb.device())?;
         let mut layers = Vec::with_capacity(num_layers);
         let block_size = 4;
+        let window_size = 512;
         for i in 0..num_layers {
             let vb_layer = vb.pp(format!("layer_{}", i));
             layers.push(TitanLayer {
-                attention: MultiHeadAttention::new(dim, 8, 2, vb_layer.pp("attention"))?, // GQA with 2 KV heads
+                attention: MultiHeadAttention::new(dim, 8, 2, window_size, vb_layer.pp("attention"))?, // GQA with 2 KV heads
                 memory: TitansMemory::new(dim, vb_layer.pp("memory"))?,
                 emulator: PythonEmulator::new(dim, vb_layer.pp("emulator"))?,
                 moe: MoE::new(dim, 4, vb_layer.pp("moe"))?, // 4 experts + shared expert
@@ -208,12 +209,24 @@ impl TitanTransformer {
         let mut total_aux_loss = Tensor::new(0f32, device)?;
 
         // Detect if we are in incremental generation mode (using KV-cache)
-        let is_incremental = kv_caches.iter().any(|c| c.is_some());
+        let kv_len = if let Some(cache) = &kv_caches[0] {
+            cache.0.dim(1)?
+        } else {
+            0
+        };
+        let is_incremental = kv_len > 0;
+        let _m_size = self.memory_tokens.dim(0)?;
 
         // Prepend persistent memory tokens ONLY if we are at the start of a sequence
         if !is_incremental {
              h = Tensor::cat(&[&self.memory_tokens, &h], 0)?;
         }
+
+        let start_pos = if is_incremental {
+            kv_len // kv_len already includes memory tokens from the prefill stage
+        } else {
+            0 // The combined tensor [memory_tokens, h] starts at 0
+        };
 
         let mut local_history = Vec::with_capacity(self.block_size);
         let mut block_summaries = Vec::with_capacity(self.layers.len() / self.block_size + 1);
@@ -224,13 +237,13 @@ impl TitanTransformer {
             let h_norm = h.apply(&layer.norm_1)?;
 
             // 1. Self-Attention with KV-Cache
-            let (attn_out, new_kv) = layer.attention.forward(&h_norm, &self.rope, kv_caches[i].clone())?;
+            let (attn_out, new_kv) = layer.attention.forward(&h_norm, &self.rope, kv_caches[i].clone(), start_pos)?;
             kv_caches[i] = Some(new_kv);
 
-            // 2. Neural Memory
+            // 2. Neural Memory (Full sequence context)
             let (radius, direction) = PolarQuant::compress(&h_norm)?;
             let h_quantized = PolarQuant::decompress(&radius, &direction)?;
-            let (mem_out, new_mem) = layer.memory.forward(&h_quantized, &memory_states[i], &self.rope)?;
+            let (mem_out, new_mem) = layer.memory.forward(&h_quantized, &memory_states[i], &self.rope, start_pos)?;
             memory_states[i] = new_mem;
 
             // 3. Program Emulator
@@ -248,7 +261,7 @@ impl TitanTransformer {
             parallel_out = (parallel_out.broadcast_add(&new_prog.broadcast_mul(&g_emu)?))?;
 
             // 4. Block Attention Residuals
-            let attn_res_out = self.block_attn_res.forward(&block_summaries, &parallel_out, &self.rope)?;
+            let attn_res_out = self.block_attn_res.forward(&block_summaries, &parallel_out, &self.rope, start_pos)?;
 
             h = (h + attn_res_out.broadcast_mul(&layer.layerscale_1)?)?;
 

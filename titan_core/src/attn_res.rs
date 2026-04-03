@@ -24,7 +24,7 @@ impl FullAttnRes {
     }
 
     /// Performs the forward pass using the last hidden state as a query over all previous states.
-    pub fn forward(&self, hidden_states: &[Tensor], rope: &RotaryEmbedding) -> Result<Tensor> {
+    pub fn forward(&self, hidden_states: &[Tensor], rope: &RotaryEmbedding, start_pos: usize) -> Result<Tensor> {
         if hidden_states.is_empty() {
             candle_core::bail!("hidden_states cannot be empty");
         }
@@ -34,7 +34,7 @@ impl FullAttnRes {
 
         // 1. Prepare Query
         let q = query_state.apply(&self.q_proj)?;
-        let q = rope.apply(&q)?; // [T, D]
+        let q = rope.apply(&q, start_pos)?; // [T, D]
 
         // 2. Prepare Keys and Values from all layers
         let mut k_stack = Vec::with_capacity(l);
@@ -44,7 +44,9 @@ impl FullAttnRes {
             let k = state.apply(&self.k_proj)?;
             let v = state.apply(&self.v_proj)?;
 
-            k_stack.push(rope.apply(&k)?.unsqueeze(0)?); // [1, T, D]
+            // Each layer's output passed here was computed at its own "time"
+            // For cross-layer attention, we can use 0 or some fixed position since it's per-token
+            k_stack.push(rope.apply(&k, 0)?.unsqueeze(0)?); // [1, T, D]
             v_stack.push(v.unsqueeze(0)?); // [1, T, D]
         }
 
@@ -93,7 +95,7 @@ impl BlockAttnRes {
     }
 
     /// Performs the forward pass using cross-attention over block outputs.
-    pub fn forward(&self, states: &[Tensor], current: &Tensor, rope: &RotaryEmbedding) -> Result<Tensor> {
+    pub fn forward(&self, states: &[Tensor], current: &Tensor, rope: &RotaryEmbedding, start_pos: usize) -> Result<Tensor> {
         if states.is_empty() {
             return Ok(current.clone());
         }
@@ -103,7 +105,7 @@ impl BlockAttnRes {
         let l = all_history.len();
 
         let q = current.apply(&self.q_proj)?;
-        let q = rope.apply(&q)?.unsqueeze(1)?; // [T, 1, D]
+        let q = rope.apply(&q, start_pos)?.unsqueeze(1)?; // [T, 1, D]
 
         let mut k_stack = Vec::with_capacity(l);
         let mut v_stack = Vec::with_capacity(l);
@@ -111,7 +113,7 @@ impl BlockAttnRes {
         for state in &all_history {
             let k = state.apply(&self.k_proj)?;
             let v = state.apply(&self.v_proj)?;
-            k_stack.push(rope.apply(&k)?.unsqueeze(0)?);
+            k_stack.push(rope.apply(&k, 0)?.unsqueeze(0)?);
             v_stack.push(v.unsqueeze(0)?);
         }
 

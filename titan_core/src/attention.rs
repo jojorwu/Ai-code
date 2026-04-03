@@ -12,10 +12,11 @@ pub struct MultiHeadAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    window_size: usize,
 }
 
 impl MultiHeadAttention {
-    pub fn new(dim: usize, num_heads: usize, num_kv_heads: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn new(dim: usize, num_heads: usize, num_kv_heads: usize, window_size: usize, vb: VarBuilder) -> Result<Self> {
         let head_dim = dim / num_heads;
         let q_proj = linear(dim, dim, vb.pp("q_proj"))?;
         let k_proj = linear(dim, num_kv_heads * head_dim, vb.pp("k_proj"))?;
@@ -35,6 +36,7 @@ impl MultiHeadAttention {
             num_heads,
             num_kv_heads,
             head_dim,
+            window_size,
         })
     }
 
@@ -42,7 +44,8 @@ impl MultiHeadAttention {
         &self,
         x: &Tensor,
         rope: &RotaryEmbedding,
-        kv_cache: Option<(Tensor, Tensor)>
+        kv_cache: Option<(Tensor, Tensor)>,
+        start_pos: usize,
     ) -> Result<(Tensor, (Tensor, Tensor))> {
         let (t_size, _d_size) = x.dims2()?;
 
@@ -59,14 +62,25 @@ impl MultiHeadAttention {
         let q = q.apply(&self.q_norm)?;
         let mut k = k.apply(&self.k_norm)?;
 
-        // Apply RoPE
-        let q = rope.apply(&q)?;
-        let k_rope = rope.apply(&k)?;
+        // Apply RoPE with correct start position
+        let q = rope.apply(&q, start_pos)?;
+        let k_rope = rope.apply(&k, start_pos)?;
 
-        // Update KV cache if provided
+        // Update KV cache with 8-bit quantization and sliding window truncation
         if let Some((prev_k, prev_v)) = kv_cache {
+            // Simulated 8-bit Quant: Store as F32 but restrict precision
+            let prev_k = (prev_k.affine(127.0, 0.0)?.round()? / 127.0)?;
+            let prev_v = (prev_v.affine(127.0, 0.0)?.round()? / 127.0)?;
+
             k = Tensor::cat(&[prev_k, k_rope], 1)?;
             v = Tensor::cat(&[prev_v, v], 1)?;
+
+            // Truncate KV-cache to window_size to manage context growth
+            let cur_kv_len = k.dim(1)?;
+            if cur_kv_len > self.window_size {
+                 k = k.narrow(1, cur_kv_len - self.window_size, self.window_size)?;
+                 v = v.narrow(1, cur_kv_len - self.window_size, self.window_size)?;
+            }
         } else {
             k = k_rope;
         }
@@ -89,10 +103,10 @@ impl MultiHeadAttention {
         let scale = (self.head_dim as f64).sqrt();
         let scores = (q.matmul(&k_rep.transpose(D::Minus1, D::Minus2)?)? / scale)?;
 
-        // causal mask (only if sequence length > 1)
+        // sliding window causal mask
         let seq_len = q.dim(1)?;
         let kv_len = k_rep.dim(1)?;
-        if seq_len > 1 {
+        if seq_len > 1 || kv_len > 1 {
              let mask = self.get_causal_mask(seq_len, kv_len, x.device())?;
              let scores = scores.broadcast_add(&mask)?;
              let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
@@ -119,7 +133,15 @@ impl MultiHeadAttention {
         let mask: Vec<_> = (0..q_len)
             .flat_map(|i| {
                 let i_abs = i + kv_len - q_len;
-                (0..kv_len).map(move |j| if j > i_abs { f32::NEG_INFINITY } else { 0f32 })
+                (0..kv_len).map(move |j| {
+                    // Causal mask: j > i_abs
+                    // Sliding window: j < i_abs - window_size
+                    if j > i_abs || (i_abs >= self.window_size && j < i_abs - self.window_size) {
+                         f32::NEG_INFINITY
+                    } else {
+                        0f32
+                    }
+                })
             })
             .collect();
         Tensor::from_slice(&mask, (q_len, kv_len), device)

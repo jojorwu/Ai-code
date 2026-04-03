@@ -50,7 +50,8 @@ impl TitansMemory {
         &self,
         x: &Tensor,
         memory_matrices: &Tensor,
-        rope: &RotaryEmbedding
+        rope: &RotaryEmbedding,
+        start_pos: usize,
     ) -> Result<(Tensor, Tensor)> {
         // x: [T, D], memory_matrices: [H, Hd, Hd]
         let (t_size, d_size) = x.dims2()?;
@@ -61,8 +62,8 @@ impl TitansMemory {
         // Apply SiLU gate to values (Gated Linear Unit like capacity)
         vals = candle_nn::ops::silu(&vals)?;
 
-        // Apply RoPE to keys
-        keys = rope.apply(&keys)?;
+        // Apply RoPE with correct start position
+        keys = rope.apply(&keys, start_pos)?;
         let gate = ops::sigmoid(&x.apply(&self.gate_proj)?)?; // [T, D]
 
         // Reshape for multi-head: [T, H, Hd]
@@ -117,8 +118,11 @@ impl TitansMemory {
 
         let one_minus_decay = (decay.neg()?.affine(1.0, 1.0))?;
 
-        // Pre-convert eta and one_minus_decay to tensors on the correct device
+        // Pre-convert eta to a scalar for faster application if possible
         let eta_val = eta.to_vec0::<f32>()?;
+
+        // Pre-calculate per-token gates mean to avoid repeated calls in the loop
+        let gate_means = gate.mean(1)?.to_vec1::<f32>()?;
 
         for t in 0..t_size {
             let kt = keys.narrow(0, t, 1)?; // [1, Hd]
@@ -132,13 +136,13 @@ impl TitansMemory {
             let diff = (vt - yt)?;
             let l2_norm_sq = diff.sqr()?.sum_all()?.to_vec0::<f32>()?;
             let surprise_refined = (l2_norm_sq as f64).tanh();
-            let gt = (gate.narrow(0, t, 1)?.mean_all()?.to_vec0::<f32>()? as f64 * surprise_refined) as f32;
+            let gt = gate_means[t] as f64 * surprise_refined;
 
             // 3. Delta update: ΔM = (v_t - y_t) ⊗ k_t
             let update = kt.t()?.matmul(&diff)?;
 
             // 4. Update M: M_t = (1 - decay) * M_{t-1} + (eta * surprise) * ΔM
-            let gated_eta_val = eta_val * gt;
+            let gated_eta_val = (eta_val as f64 * gt) as f32;
             current_m = current_m
                 .broadcast_mul(&one_minus_decay)?
                 .broadcast_add(&update.affine(gated_eta_val as f64, 0.0)?)?;

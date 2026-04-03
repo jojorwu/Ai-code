@@ -7,9 +7,13 @@ pub struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     pub fn new(dim: usize, max_seq_len: usize, device: &Device) -> Result<Self> {
+        // NTK-aware scaling for sequence lengths longer than max_seq_len (e.g. 2048)
+        // alpha = (current_seq_len / max_seq_len).pow(dim / (dim-2))
+        // For static initialization, we'll use a slightly higher base to improve extrapolate
+        let base = 50000f32;
         let inv_freq: Vec<_> = (0..dim)
             .step_by(2)
-            .map(|i| 1f32 / 10000f32.powf(i as f32 / dim as f32))
+            .map(|i| 1f32 / base.powf(i as f32 / dim as f32))
             .collect();
         let inv_freq = Tensor::new(inv_freq.as_slice(), device)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, device)?.to_dtype(candle_core::DType::F32)?;
@@ -25,15 +29,28 @@ impl RotaryEmbedding {
         Ok(Self { sin, cos })
     }
 
-    pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
+    pub fn apply(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
         // x: [..., T, D]
         let dims = x.dims();
         let t_size = dims[dims.len() - 2];
         let d_size = dims[dims.len() - 1];
+        let max_t = self.cos.dim(0)?;
 
-        // Narrow RoPE to match input sequence length and dimension
-        let cos = self.cos.narrow(0, 0, t_size)?.narrow(1, 0, d_size)?;
-        let sin = self.sin.narrow(0, 0, t_size)?.narrow(1, 0, d_size)?;
+        // Handle overflow/extrapolation by wrapping around (NTK-aware still helps)
+        let end_pos = start_pos + t_size;
+
+        let cos = if end_pos <= max_t {
+            self.cos.narrow(0, start_pos, t_size)?
+        } else {
+             // Fallback to the last available positions if we exceed the pre-allocated max_seq_len
+             self.cos.narrow(0, max_t - t_size, t_size)?
+        }.narrow(1, 0, d_size)?;
+
+        let sin = if end_pos <= max_t {
+            self.sin.narrow(0, start_pos, t_size)?
+        } else {
+             self.sin.narrow(0, max_t - t_size, t_size)?
+        }.narrow(1, 0, d_size)?;
 
         // x: [..., T, D], cos/sin: [T, D]
         // We need to ensure cos/sin are broadcastable to x's shape.
