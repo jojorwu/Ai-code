@@ -26,6 +26,7 @@ pub struct PyTitanTransformer {
     num_layers: usize,
     memory_states: Vec<Tensor>,
     program_states: Vec<Tensor>,
+    kv_caches: Vec<Option<(Tensor, Tensor)>>,
     optimizer: Option<AdamW>,
 }
 
@@ -45,10 +46,12 @@ impl PyTitanTransformer {
         let head_dim = dim / num_heads;
         let mut memory_states = Vec::with_capacity(num_layers);
         let mut program_states = Vec::with_capacity(num_layers);
+        let mut kv_caches = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
             // Multi-head memory state [H, Hd, Hd]
             memory_states.push(Tensor::zeros((num_heads, head_dim, head_dim), DType::F32, &device).map_err(to_py_err)?);
             program_states.push(Tensor::zeros((1, dim), DType::F32, &device).map_err(to_py_err)?);
+            kv_caches.push(None);
         }
 
         Ok(Self {
@@ -58,6 +61,7 @@ impl PyTitanTransformer {
             num_layers,
             memory_states,
             program_states,
+            kv_caches,
             optimizer: None,
         })
     }
@@ -85,7 +89,7 @@ impl PyTitanTransformer {
         Ok(())
     }
 
-    #[doc = "Resets the persistent internal long-term memory and program states to zero."]
+    #[doc = "Resets the persistent internal long-term memory, program states, and KV-cache to zero/empty."]
     fn reset_state(&mut self) -> PyResult<()> {
         let device = Device::Cpu;
         let num_heads = 8;
@@ -95,6 +99,7 @@ impl PyTitanTransformer {
                 Tensor::zeros((num_heads, head_dim, head_dim), DType::F32, &device).map_err(to_py_err)?;
             self.program_states[i] =
                 Tensor::zeros((1, self.dim), DType::F32, &device).map_err(to_py_err)?;
+            self.kv_caches[i] = None;
         }
         Ok(())
     }
@@ -110,7 +115,7 @@ impl PyTitanTransformer {
 
         let out = self
             .inner
-            .forward(&x, &mut self.memory_states, &mut self.program_states)
+            .forward(&x, &mut self.memory_states, &mut self.program_states, &mut self.kv_caches)
             .map_err(to_py_err)?;
 
         let (rows, cols) = out.dims2().map_err(to_py_err)?;
@@ -134,9 +139,15 @@ impl PyTitanTransformer {
         let x = Tensor::from_vec(x_ids, Shape::from(n), &device).map_err(to_py_err)?;
         let targets = Tensor::from_vec(target_ids, Shape::from(n), &device).map_err(to_py_err)?;
 
+        // During training, we typically don't use KV cache or we want to reset it.
+        // For simplicity, we'll reset it here.
+        for i in 0..self.num_layers {
+             self.kv_caches[i] = None;
+        }
+
         let logits = self
             .inner
-            .forward(&x, &mut self.memory_states, &mut self.program_states)
+            .forward(&x, &mut self.memory_states, &mut self.program_states, &mut self.kv_caches)
             .map_err(to_py_err)?;
 
         let log_sm = candle_nn::ops::log_softmax(&logits, candle_core::D::Minus1).map_err(to_py_err)?;

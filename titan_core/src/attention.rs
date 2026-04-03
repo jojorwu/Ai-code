@@ -31,7 +31,12 @@ impl MultiHeadAttention {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, rope: &RotaryEmbedding) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+        kv_cache: Option<(Tensor, Tensor)>
+    ) -> Result<(Tensor, (Tensor, Tensor))> {
         let (t_size, _d_size) = x.dims2()?;
 
         let q = x.apply(&self.q_proj)?;
@@ -40,20 +45,30 @@ impl MultiHeadAttention {
 
         // Reshape for GQA: q: [H, T, Hd], k/v: [Hkv, T, Hd]
         let q = q.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?;
-        let k = k.reshape((t_size, self.num_kv_heads, self.head_dim))?.transpose(0, 1)?;
-        let v = v.reshape((t_size, self.num_kv_heads, self.head_dim))?.transpose(0, 1)?;
+        let mut k = k.reshape((t_size, self.num_kv_heads, self.head_dim))?.transpose(0, 1)?;
+        let mut v = v.reshape((t_size, self.num_kv_heads, self.head_dim))?.transpose(0, 1)?;
 
         // Apply RoPE
         let q = rope.apply(&q)?;
-        let k = rope.apply(&k)?;
+        let k_rope = rope.apply(&k)?;
+
+        // Update KV cache if provided
+        if let Some((prev_k, prev_v)) = kv_cache {
+            k = Tensor::cat(&[prev_k, k_rope], 1)?;
+            v = Tensor::cat(&[prev_v, v], 1)?;
+        } else {
+            k = k_rope;
+        }
+
+        let current_kv = (k.clone(), v.clone());
 
         // Repeat KV heads to match Q heads if needed
-        let k = if self.num_heads != self.num_kv_heads {
+        let k_rep = if self.num_heads != self.num_kv_heads {
             self.repeat_heads(&k)?
         } else {
             k
         };
-        let v = if self.num_heads != self.num_kv_heads {
+        let v_rep = if self.num_heads != self.num_kv_heads {
             self.repeat_heads(&v)?
         } else {
             v
@@ -61,18 +76,24 @@ impl MultiHeadAttention {
 
         // scaled dot-product attention
         let scale = (self.head_dim as f64).sqrt();
-        let scores = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?)? / scale)?;
+        let scores = (q.matmul(&k_rep.transpose(D::Minus1, D::Minus2)?)? / scale)?;
 
-        // causal mask
-        let mask = self.get_causal_mask(t_size, x.device())?;
-        let scores = scores.broadcast_add(&mask)?;
-
-        let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        let context = attn.matmul(&v)?; // [H, T, Hd]
-
-        // Reshape back
-        let context = context.transpose(0, 1)?.reshape((t_size, self.num_heads * self.head_dim))?;
-        context.apply(&self.out_proj)
+        // causal mask (only if sequence length > 1)
+        let seq_len = q.dim(1)?;
+        let kv_len = k_rep.dim(1)?;
+        if seq_len > 1 {
+             let mask = self.get_causal_mask(seq_len, kv_len, x.device())?;
+             let scores = scores.broadcast_add(&mask)?;
+             let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
+             let context = attn.matmul(&v_rep)?;
+             let context = context.transpose(0, 1)?.reshape((t_size, self.num_heads * self.head_dim))?;
+             Ok((context.apply(&self.out_proj)?, current_kv))
+        } else {
+             let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
+             let context = attn.matmul(&v_rep)?;
+             let context = context.transpose(0, 1)?.reshape((t_size, self.num_heads * self.head_dim))?;
+             Ok((context.apply(&self.out_proj)?, current_kv))
+        }
     }
 
     fn repeat_heads(&self, x: &Tensor) -> Result<Tensor> {
@@ -83,10 +104,13 @@ impl MultiHeadAttention {
             .reshape((self.num_heads, t_size, head_dim))
     }
 
-    fn get_causal_mask(&self, t: usize, device: &candle_core::Device) -> Result<Tensor> {
-        let mask: Vec<_> = (0..t)
-            .flat_map(|i| (0..t).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 }))
+    fn get_causal_mask(&self, q_len: usize, kv_len: usize, device: &candle_core::Device) -> Result<Tensor> {
+        let mask: Vec<_> = (0..q_len)
+            .flat_map(|i| {
+                let i_abs = i + kv_len - q_len;
+                (0..kv_len).map(move |j| if j > i_abs { f32::NEG_INFINITY } else { 0f32 })
+            })
             .collect();
-        Tensor::from_slice(&mask, (t, t), device)
+        Tensor::from_slice(&mask, (q_len, kv_len), device)
     }
 }

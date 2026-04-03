@@ -8,45 +8,56 @@ use candle_nn::{VarBuilder, linear, Linear};
 pub struct PythonEmulator {
     up_proj: Linear,
     down_proj: Linear,
-    gate_proj: Linear,
+    // GRU Gates
+    update_gate: Linear,
+    reset_gate: Linear,
+    candidate_gate: Linear,
 }
 
 impl PythonEmulator {
-    /// Creates a new `PythonEmulator` instance.
+    /// Creates a new `PythonEmulator` instance with a GRU-based state update.
     pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
         let up_proj = linear(dim, dim * 2, vb.pp("up_proj"))?;
         let down_proj = linear(dim * 2, dim, vb.pp("down_proj"))?;
-        let gate_proj = linear(dim, dim, vb.pp("gate_proj"))?;
+
+        let update_gate = linear(dim, dim, vb.pp("update_gate"))?;
+        let reset_gate = linear(dim, dim, vb.pp("reset_gate"))?;
+        let candidate_gate = linear(dim, dim, vb.pp("candidate_gate"))?;
+
         Ok(Self {
             up_proj,
             down_proj,
-            gate_proj,
+            update_gate,
+            reset_gate,
+            candidate_gate,
         })
     }
 
-    /// Updates the persistent internal program state with a new sequence of instructions.
-    ///
-    /// # Arguments
-    /// * `instruction_rep` - Tensor of shape `[T, D]` representing the instructions.
-    /// * `current_state` - Tensor of shape `[1, D]` representing the current state.
-    ///
-    /// # Returns
-    /// The updated state as a tensor of shape `[1, D]`.
+    /// Updates the persistent internal program state using a GRU mechanism.
     pub fn step(&self, instruction_rep: &Tensor, current_state: &Tensor) -> Result<Tensor> {
-        // Use MLP to process instructions: Linear -> SiLU -> Linear
+        // Use MLP to process instructions
         let h = instruction_rep.apply(&self.up_proj)?;
         let h = candle_nn::ops::silu(&h)?;
-        let h = h.apply(&self.down_proj)?;
+        let x = h.apply(&self.down_proj)?;
 
-        // Aggregate instructions from the whole sequence [1, D]
-        let instruction_agg = h.mean_keepdim(0)?;
+        // Aggregate instructions [1, D]
+        let x_agg = x.mean_keepdim(0)?;
 
-        // Compute a gating mechanism to determine how much of the old state to keep
-        let gate = candle_nn::ops::sigmoid(&current_state.apply(&self.gate_proj)?)?;
-        // Gated update: state = (1 - gate) * old_state + gate * instruction_agg
-        let new_state = ((current_state * (1.0 - &gate)?)? + (instruction_agg * &gate)?)?;
+        // GRU logic for state h
+        // z = sigmoid(Wz * x + Uz * h)
+        // r = sigmoid(Wr * x + Ur * h)
+        // n = tanh(Wn * x + r * (Un * h))
+        // h_new = (1 - z) * h + z * n
 
-        // Normalize state using tanh
-        new_state.tanh()
+        let z = candle_nn::ops::sigmoid(&x_agg.apply(&self.update_gate)?)?;
+        let r = candle_nn::ops::sigmoid(&x_agg.apply(&self.reset_gate)?)?;
+
+        let gated_state = current_state.broadcast_mul(&r)?;
+        let candidate = (x_agg.apply(&self.candidate_gate)? + gated_state)?.tanh()?;
+
+        let one_minus_z = z.neg()?.affine(1.0, 1.0)?;
+        let new_state = (current_state.broadcast_mul(&one_minus_z)? + candidate.broadcast_mul(&z)?)?;
+
+        Ok(new_state)
     }
 }
