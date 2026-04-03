@@ -29,8 +29,9 @@ impl TitansMemory {
         let gate_proj = linear(dim, dim, vb.pp("gate_proj"))?;
         let out_proj = linear(dim, dim, vb.pp("out_proj"))?;
 
-        let eta = vb.get((1,), "eta")?;
-        let decay = vb.get((1,), "decay")?;
+        // Per-head learnable parameters [H]
+        let eta = vb.get((num_heads,), "eta")?;
+        let decay = vb.get((num_heads,), "decay")?;
 
         Ok(Self {
             key_proj,
@@ -69,9 +70,9 @@ impl TitansMemory {
         let vals = vals.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?; // [H, T, Hd]
         let gate = gate.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?; // [H, T, Hd]
 
-        // Hyperparameters for the Delta-rule (learnable, vectorized)
-        let eta = (ops::sigmoid(&self.eta)? * 0.5)?;
-        let decay = (ops::sigmoid(&self.decay)? * 0.1)?;
+        // Hyperparameters for the Delta-rule (learnable per-head, vectorized)
+        let etas = (ops::sigmoid(&self.eta)? * 0.5)?;
+        let decays = (ops::sigmoid(&self.decay)? * 0.1)?;
 
         let mut new_m_list = Vec::with_capacity(self.num_heads);
         let mut final_head_outputs = Vec::with_capacity(self.num_heads);
@@ -83,7 +84,10 @@ impl TitansMemory {
             let gh = gate.get(h)?; // [T, Hd]
             let mh = memory_matrices.get(h)?; // [Hd, Hd]
 
-            let (y_h, m_h_new) = self.update_memory_loop(&kh, &vh, &gh, &mh, &eta, &decay)?;
+            let eta_h = etas.get(h)?; // [1]
+            let decay_h = decays.get(h)?; // [1]
+
+            let (y_h, m_h_new) = self.update_memory_loop(&kh, &vh, &gh, &mh, &eta_h, &decay_h)?;
 
             final_head_outputs.push(y_h.unsqueeze(1)?); // [T, 1, Hd]
             new_m_list.push(m_h_new.unsqueeze(0)?); // [1, Hd, Hd]
@@ -107,28 +111,37 @@ impl TitansMemory {
         eta: &Tensor,
         decay: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        let (t_size, hd_size) = keys.dims2()?;
+        let (t_size, _hd_size) = keys.dims2()?;
         let mut current_m = initial_matrix.clone();
         let mut outputs = Vec::with_capacity(t_size);
 
         let one_minus_decay = (decay.neg()?.affine(1.0, 1.0))?;
 
-        for t in 0..t_size {
-            let kt = keys.get(t)?.reshape((1, hd_size))?;
-            let vt = vals.get(t)?.reshape((1, hd_size))?;
-            let gt = gate.get(t)?.mean_all()?;
+        // Pre-convert eta and one_minus_decay to tensors on the correct device
+        let eta_val = eta.to_vec0::<f32>()?;
 
-            // y_t = k_t * M_{t-1}
+        for t in 0..t_size {
+            let kt = keys.narrow(0, t, 1)?; // [1, Hd]
+            let vt = vals.narrow(0, t, 1)?; // [1, Hd]
+
+            // 1. Retrieve from memory: y_t = k_t * M_{t-1}
             let yt = kt.matmul(&current_m)?;
             outputs.push(yt.clone());
 
-            // ΔM = (v_t - y_t) ⊗ k_t
+            // 2. Compute surprise gate: how different is expected v_t from retrieved y_t?
             let diff = (vt - yt)?;
+            let l2_norm_sq = diff.sqr()?.sum_all()?.to_vec0::<f32>()?;
+            let surprise_refined = (l2_norm_sq as f64).tanh();
+            let gt = (gate.narrow(0, t, 1)?.mean_all()?.to_vec0::<f32>()? as f64 * surprise_refined) as f32;
+
+            // 3. Delta update: ΔM = (v_t - y_t) ⊗ k_t
             let update = kt.t()?.matmul(&diff)?;
 
-            // M_t = (1 - decay) * M_{t-1} + eta * surprise_gate * ΔM
-            let gated_eta = (eta.broadcast_mul(&gt))?;
-            current_m = (current_m.broadcast_mul(&one_minus_decay)?.broadcast_add(&update.broadcast_mul(&gated_eta)?)?);
+            // 4. Update M: M_t = (1 - decay) * M_{t-1} + (eta * surprise) * ΔM
+            let gated_eta_val = eta_val * gt;
+            current_m = current_m
+                .broadcast_mul(&one_minus_decay)?
+                .broadcast_add(&update.affine(gated_eta_val as f64, 0.0)?)?;
         }
 
         let output = Tensor::cat(&outputs, 0)?;

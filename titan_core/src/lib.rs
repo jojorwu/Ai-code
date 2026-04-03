@@ -113,7 +113,7 @@ impl PyTitanTransformer {
         }
         let x = Tensor::from_vec(x_ids, Shape::from(n), &device).map_err(to_py_err)?;
 
-        let out = self
+        let (out, _aux_loss) = self
             .inner
             .forward(&x, &mut self.memory_states, &mut self.program_states, &mut self.kv_caches)
             .map_err(to_py_err)?;
@@ -145,20 +145,23 @@ impl PyTitanTransformer {
              self.kv_caches[i] = None;
         }
 
-        let logits = self
+        let (logits, aux_loss) = self
             .inner
             .forward(&x, &mut self.memory_states, &mut self.program_states, &mut self.kv_caches)
             .map_err(to_py_err)?;
 
         let log_sm = candle_nn::ops::log_softmax(&logits, candle_core::D::Minus1).map_err(to_py_err)?;
 
-        let loss = candle_nn::loss::nll(&log_sm, &targets).map_err(to_py_err)?;
+        let nll_loss = candle_nn::loss::nll(&log_sm, &targets).map_err(to_py_err)?;
+
+        // Total loss = NLL + 0.1 * Auxiliary MoE Balancing Loss
+        let total_loss = (nll_loss + (aux_loss * 0.1).map_err(to_py_err)?) .map_err(to_py_err)?;
 
         if let Some(opt) = &mut self.optimizer {
-            opt.backward_step(&loss).map_err(to_py_err)?;
+            opt.backward_step(&total_loss).map_err(to_py_err)?;
         }
 
-        let loss_val = loss.to_vec0::<f32>().map_err(to_py_err)?;
+        let loss_val = total_loss.to_vec0::<f32>().map_err(to_py_err)?;
 
         Ok(loss_val)
     }

@@ -1,7 +1,6 @@
 use candle_core::{Tensor, Result};
-use candle_nn::{embedding, linear, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_nn::{embedding, linear, rms_norm, conv1d, Conv1d, Conv1dConfig, Embedding, Linear, RmsNorm, VarBuilder, Init};
 use crate::attention::MultiHeadAttention;
-use crate::attn_res::FullAttnRes;
 use crate::titans::TitansMemory;
 use crate::emulator::PythonEmulator;
 use crate::quant::PolarQuant;
@@ -20,30 +19,50 @@ pub struct TitanTransformer {
     block_size: usize,
 }
 
-/// Feed-Forward Network (FFN) block using SwiGLU activation.
+/// Feed-Forward Network (FFN) block using SwiGLU activation and depthwise Conv1D.
 pub struct FFN {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
+    conv: Conv1d,
 }
 
 impl FFN {
-    /// Creates a new FFN block with SwiGLU.
+    /// Creates a new FFN block with Conv-GLU structure.
     pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let hidden_dim = (dim * 8) / 3; // Standard for SwiGLU to keep params similar to 4x FFN
+        let hidden_dim = (dim * 8) / 3;
         let gate_proj = linear(dim, hidden_dim, vb.pp("gate_proj"))?;
         let up_proj = linear(dim, hidden_dim, vb.pp("up_proj"))?;
         let down_proj = linear(hidden_dim, dim, vb.pp("down_proj"))?;
+
+        // Depthwise convolution: in_channels == out_channels == groups
+        let conv_cfg = Conv1dConfig {
+            padding: 1,
+            stride: 1,
+            dilation: 1,
+            groups: hidden_dim,
+        };
+        let conv = conv1d(hidden_dim, hidden_dim, 3, conv_cfg, vb.pp("conv"))?;
+
         Ok(Self {
             gate_proj,
             up_proj,
             down_proj,
+            conv,
         })
     }
 
-    /// Performs the forward pass of the FFN block.
+    /// Performs the forward pass of the FFN block with Conv-GLU.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&x.apply(&self.gate_proj)?)?;
+        // x: [T, D]
+        let gate = x.apply(&self.gate_proj)?; // [T, H]
+
+        // Apply 1D conv over sequence dimension: [1, H, T]
+        let gate = gate.t()?.unsqueeze(0)?;
+        let gate = gate.apply(&self.conv)?;
+        let gate = gate.squeeze(0)?.t()?; // [T, H]
+
+        let gate = candle_nn::ops::silu(&gate)?;
         let up = x.apply(&self.up_proj)?;
         let h = (gate * up)?;
         h.apply(&self.down_proj)
@@ -76,7 +95,8 @@ impl MoE {
     }
 
     /// Performs the forward pass of the MoE block with Top-1 routing and a Shared Expert.
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// Returns (output, auxiliary_loss)
+    pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         let router_logits = x.apply(&self.router)?;
         let routing_weights = candle_nn::ops::softmax(&router_logits, candle_core::D::Minus1)?;
 
@@ -86,33 +106,35 @@ impl MoE {
         // 2. Dynamic Experts (Top-1 routing)
         let expert_indices = router_logits.argmax(candle_core::D::Minus1)?;
 
-        // Correct implementation for architectural demonstration:
-        // We compute all experts and mask, OR we can process subset.
-        // For standard Candle CPU, mask is robust.
         for i in 0..self.num_experts {
             let expert_out = self.experts[i].forward(x)?;
 
             // Mask: 1.0 if expert_indices == i, 0.0 otherwise
             let mask = expert_indices.eq(i as u32)?; // [T] (U8)
-
-            // routing_weights has [T, E]
             let weight = routing_weights.narrow(candle_core::D::Minus1, i, 1)?.squeeze(candle_core::D::Minus1)?;
 
-            // Combine mask and weight [T]
             // Standardize both to F32 for multiplication then back to original.
             let mask_f32 = mask.to_dtype(candle_core::DType::F32)?;
-            let weight_f32 = weight.to_dtype(candle_core::DType::F32)?;
-            let combined_gate = (mask_f32 * weight_f32)?;
-            let combined_gate = combined_gate.to_dtype(x.dtype())?;
-
-            // final_output: [T, D], expert_out: [T, D], combined_gate: [T]
-            // We need to unsqueeze combined_gate to [T, 1] for broadcasting to [T, D]
+            let combined_gate = (mask_f32 * weight)?.to_dtype(x.dtype())?;
             let combined_gate = combined_gate.unsqueeze(candle_core::D::Minus1)?;
 
             final_output = (final_output + expert_out.broadcast_mul(&combined_gate)?)?;
         }
 
-        Ok(final_output)
+        // 3. Auxiliary Balancing Loss
+        let mut aux_loss = Tensor::new(0f32, x.device())?;
+
+        let t_size = routing_weights.dim(0)? as f32;
+        let p_mean = routing_weights.mean(0)?; // [E]
+
+        for i in 0..self.num_experts {
+             let f_i = expert_indices.eq(i as u32)?.to_dtype(candle_core::DType::F32)?.sum_all()?.to_vec0::<f32>()? / t_size;
+             let p_i = p_mean.get(i)?.to_vec0::<f32>()?;
+             let term = f_i * p_i * (self.num_experts as f32);
+             aux_loss = (aux_loss + Tensor::new(term, x.device())?)?;
+        }
+
+        Ok((final_output, aux_loss))
     }
 }
 
@@ -145,18 +167,17 @@ impl TitanTransformer {
                 moe: MoE::new(dim, 4, vb_layer.pp("moe"))?, // 4 experts + shared expert
                 norm_1: rms_norm(dim, 1e-5, vb_layer.pp("norm_1"))?,
                 norm_2: rms_norm(dim, 1e-5, vb_layer.pp("norm_2"))?,
-                branch_gates: vb_layer.get((3,), "branch_gates")?,
-                layerscale_1: vb_layer.get((dim,), "layerscale_1")?,
-                layerscale_2: vb_layer.get((dim,), "layerscale_2")?,
+                branch_gates: vb_layer.get_with_hints((3,), "branch_gates", Init::Const(0.1))?,
+                layerscale_1: vb_layer.get_with_hints((dim,), "layerscale_1", Init::Const(0.1))?,
+                layerscale_2: vb_layer.get_with_hints((dim,), "layerscale_2", Init::Const(0.1))?,
             });
         }
         let norm_final = rms_norm(dim, 1e-5, vb.pp("norm_final"))?;
-        let logit_cap = vb.get((1,), "logit_cap")?;
+        let logit_cap = vb.get_with_hints((1,), "logit_cap", Init::Const(2.0))?;
         let memory_tokens = vb.get((8, dim), "memory_tokens")?; // 8 persistent memory tokens
         let block_attn_res = crate::attn_res::BlockAttnRes::new(dim, vb.pp("block_attn_res"))?;
 
         // Weight Tying: The output layer shares weights with the embedding layer
-        let output_vb = vb.pp("output");
         let output_weights = embedding.embeddings().clone();
         let output = Linear::new(output_weights, None); // No bias for weight tying usually
 
@@ -174,16 +195,17 @@ impl TitanTransformer {
     }
 
     /// Performs the forward pass of the model with optional KV caching.
+    /// Returns (logits, auxiliary_loss)
     pub fn forward(
         &self,
         x: &Tensor,
         memory_states: &mut [Tensor],
         program_states: &mut [Tensor],
         kv_caches: &mut [Option<(Tensor, Tensor)>],
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor)> {
         let mut h = x.apply(&self.embedding)?;
-        let dtype = h.dtype();
         let device = h.device();
+        let mut total_aux_loss = Tensor::new(0f32, device)?;
 
         // Detect if we are in incremental generation mode (using KV-cache)
         let is_incremental = kv_caches.iter().any(|c| c.is_some());
@@ -232,7 +254,8 @@ impl TitanTransformer {
 
             // Sequential Block: MoE Feed-Forward
             let h_ffn_norm = h.apply(&layer.norm_2)?;
-            let moe_out = layer.moe.forward(&h_ffn_norm)?;
+            let (moe_out, aux_loss) = layer.moe.forward(&h_ffn_norm)?;
+            total_aux_loss = (total_aux_loss + aux_loss)?;
             h = (h + moe_out.broadcast_mul(&layer.layerscale_2)?)?;
 
             // Manage history for Block Attention Residuals
@@ -263,6 +286,6 @@ impl TitanTransformer {
         let cap = (self.logit_cap.exp()?.affine(1.0, 1.0)?.log()? + 1.0)?;
 
         let softcapped = logits.broadcast_div(&cap)?.tanh()?;
-        softcapped.broadcast_mul(&cap)
+        Ok((softcapped.broadcast_mul(&cap)?, total_aux_loss))
     }
 }
