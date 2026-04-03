@@ -55,7 +55,6 @@ pub struct TitanLayer {
     pub ffn: FFN,
     pub norm_1: RmsNorm,
     pub norm_2: RmsNorm,
-    pub norm_attn: RmsNorm,
 }
 
 impl TitanTransformer {
@@ -67,14 +66,13 @@ impl TitanTransformer {
         for i in 0..num_layers {
             let vb_layer = vb.pp(format!("layer_{}", i));
             layers.push(TitanLayer {
-                attention: MultiHeadAttention::new(dim, 8, vb_layer.pp("attention"))?,
+                attention: MultiHeadAttention::new(dim, 8, 2, vb_layer.pp("attention"))?, // GQA with 2 KV heads
                 memory: TitansMemory::new(dim, vb_layer.pp("memory"))?,
                 emulator: PythonEmulator::new(dim, vb_layer.pp("emulator"))?,
                 attn_res: FullAttnRes::new(dim, vb_layer.pp("attn_res"))?,
                 ffn: FFN::new(dim, vb_layer.pp("ffn"))?,
                 norm_1: rms_norm(dim, 1e-5, vb_layer.pp("norm_1"))?,
                 norm_2: rms_norm(dim, 1e-5, vb_layer.pp("norm_2"))?,
-                norm_attn: rms_norm(dim, 1e-5, vb_layer.pp("norm_attn"))?,
             });
         }
         let norm_final = rms_norm(dim, 1e-5, vb.pp("norm_final"))?;
@@ -100,37 +98,36 @@ impl TitanTransformer {
         layer_outputs.push(h.clone());
 
         for (i, layer) in self.layers.iter().enumerate() {
-            // Self-Attention Block
-            let h_attn_norm = h.apply(&layer.norm_attn)?;
-            let attn_out = layer.attention.forward(&h_attn_norm, &self.rope)?;
-            h = (h + attn_out)?;
-
-            // Residual Block 1: Norm -> Memory/Emulator/AttnRes -> Add
+            // Parallel Block Architecture:
+            // h = h + SelfAttn(Norm(h)) + Memory(Norm(h)) + Emulator(Norm(h))
             let h_norm = h.apply(&layer.norm_1)?;
 
+            // 1. Self-Attention
+            let attn_out = layer.attention.forward(&h_norm, &self.rope)?;
+
+            // 2. Neural Memory
             let (radius, direction) = PolarQuant::compress(&h_norm)?;
             let h_quantized = PolarQuant::decompress(&radius, &direction)?;
-
-            // Memory update
             let (mem_out, new_mem) = layer.memory.forward(&h_quantized, &memory_states[i], &self.rope)?;
             memory_states[i] = new_mem;
 
-            // Emulator update
+            // 3. Program Emulator
             let new_prog = layer.emulator.step(&h_quantized, &program_states[i])?;
             program_states[i] = new_prog.clone();
 
-            // Combined components
-            let mut combined = mem_out.broadcast_add(&new_prog)?;
+            // Aggregate parallel components
+            let mut parallel_out = (attn_out + mem_out)?;
+            parallel_out = parallel_out.broadcast_add(&new_prog)?;
 
-            // Attention Residuals
-            layer_outputs.push(combined.clone());
-            combined = layer.attn_res.forward(&layer_outputs, &self.rope)?;
+            // 4. Attention Residuals (Long-term cross-layer aggregation)
+            layer_outputs.push(parallel_out.clone());
+            let attn_res_out = layer.attn_res.forward(&layer_outputs, &self.rope)?;
 
-            h = (h + combined)?;
+            h = (h + attn_res_out)?;
 
-            // Residual Block 2: Norm -> FFN -> Add
-            let h_ffn = h.apply(&layer.norm_2)?;
-            h = (h + layer.ffn.forward(&h_ffn)?)?;
+            // Sequential Block: Feed-Forward
+            let h_ffn_norm = h.apply(&layer.norm_2)?;
+            h = (h + layer.ffn.forward(&h_ffn_norm)?)?;
         }
 
         h.apply(&self.norm_final)?.apply(&self.output)

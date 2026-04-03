@@ -12,6 +12,8 @@ pub struct TitansMemory {
     val_proj: Linear,
     gate_proj: Linear,
     out_proj: Linear,
+    eta: Tensor,
+    decay: Tensor,
     num_heads: usize,
     head_dim: usize,
 }
@@ -27,11 +29,16 @@ impl TitansMemory {
         let gate_proj = linear(dim, dim, vb.pp("gate_proj"))?;
         let out_proj = linear(dim, dim, vb.pp("out_proj"))?;
 
+        let eta = vb.get((1,), "eta")?;
+        let decay = vb.get((1,), "decay")?;
+
         Ok(Self {
             key_proj,
             val_proj,
             gate_proj,
             out_proj,
+            eta,
+            decay,
             num_heads,
             head_dim,
         })
@@ -59,8 +66,9 @@ impl TitansMemory {
         let vals = vals.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?; // [H, T, Hd]
         let gate = gate.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?; // [H, T, Hd]
 
-        let eta = 0.1;
-        let decay = 0.01;
+        // Hyperparameters for the Delta-rule (learnable)
+        let eta = ops::sigmoid(&self.eta)?.flatten_all()?.to_vec1::<f32>()?[0] as f64 * 0.5; // Scale to [0, 0.5]
+        let decay = ops::sigmoid(&self.decay)?.flatten_all()?.to_vec1::<f32>()?[0] as f64 * 0.1; // Scale to [0, 0.1]
 
         let mut new_m_list = Vec::with_capacity(self.num_heads);
         let mut final_head_outputs = Vec::with_capacity(self.num_heads);
