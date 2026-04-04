@@ -1,13 +1,4 @@
-import sys
-import os
-
-# Ensure the .so can be found
-sys.path.append(os.path.join(os.getcwd(), "titan_core"))
-
-try:
-    import titan_core as titan
-except ImportError:
-    import titan_core.titan_core as titan
+import titan_py as titan
 
 def train_demo():
     print("Titan Training Demo (Structural)")
@@ -15,7 +6,7 @@ def train_demo():
     dim = 128
     num_layers = 4
 
-    model = titan.PyTitanTransformer(vocab_size, dim, num_layers)
+    model = titan.TitanTransformer(vocab_size, dim, num_layers)
 
     # Simulating a sequence of code snippets
     code_snippets = [
