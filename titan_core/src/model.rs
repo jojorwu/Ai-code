@@ -27,6 +27,7 @@ pub struct Config {
     pub global_attn_period: usize,
     pub use_weight_std: bool,
     pub use_turbo_quant: bool,
+    pub use_differential_attn: bool,
     pub drop_path_rate: f32,
 }
 
@@ -45,6 +46,7 @@ impl Default for Config {
             global_attn_period: 4,
             use_weight_std: true,
             use_turbo_quant: false,
+            use_differential_attn: false,
             drop_path_rate: 0.1,
         }
     }
@@ -273,6 +275,7 @@ impl TitanTransformer {
                     config.num_kv_heads,
                     config.window_size,
                     is_global,
+                    config.use_differential_attn,
                     vb_layer.pp("attention")
                 )?,
                 memory: TitansMemory::new(config.dim, config.num_heads, config.use_turbo_quant, vb_layer.pp("memory"))?,

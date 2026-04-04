@@ -33,6 +33,7 @@ class TitanTransformer:
         global_attn_period: Optional[int] = None,
         use_weight_std: Optional[bool] = None,
         use_turbo_quant: Optional[bool] = None,
+        use_differential_attn: Optional[bool] = None,
         drop_path_rate: Optional[float] = None,
     ):
         self._inner = PyTitanTransformer(
@@ -48,6 +49,7 @@ class TitanTransformer:
             global_attn_period,
             use_weight_std,
             use_turbo_quant,
+            use_differential_attn,
             drop_path_rate
         )
 
