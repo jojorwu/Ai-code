@@ -19,6 +19,7 @@ pub struct TitansMemory {
     gate_proj: Linear,
     out_proj: Linear,
     surprise_proj: Linear,
+    write_gate_proj: Linear,
     decay_proj: Linear,
     use_turbo_quant: bool,
     eta: Tensor,
@@ -36,6 +37,7 @@ impl TitansMemory {
         let gate_proj = linear(dim, dim, vb.pp("gate_proj"))?;
         let out_proj = linear(dim, dim, vb.pp("out_proj"))?;
         let surprise_proj = linear(head_dim, 1, vb.pp("surprise_proj"))?;
+        let write_gate_proj = linear(dim, num_heads, vb.pp("write_gate_proj"))?;
         let decay_proj = linear(dim, num_heads, vb.pp("decay_proj"))?;
 
         // Per-head learnable parameters [H]
@@ -47,6 +49,7 @@ impl TitansMemory {
             gate_proj,
             out_proj,
             surprise_proj,
+            write_gate_proj,
             decay_proj,
             use_turbo_quant,
             eta,
@@ -94,10 +97,12 @@ impl TitansMemory {
         let etas = (ops::sigmoid(&self.eta)? * 0.5)?; // [H]
         // Dynamic context-aware decay [H, T]
         let decays = (ops::sigmoid(&x.apply(&self.decay_proj)?)? * 0.1)?.transpose(0, 1)?;
+        // Dynamic context-aware write gates [H, T]
+        let write_gates = ops::sigmoid(&x.apply(&self.write_gate_proj)?)?.transpose(0, 1)?;
 
         // Vectorized memory update across all heads
         let (output, updated_memory) = self.update_memory_vectorized(
-            &keys, &vals, &gate, memory_matrices, &etas, &decays
+            &keys, &vals, &gate, memory_matrices, &etas, &decays, &write_gates
         )?;
 
         // output: [H, T, Hd] -> [T, H, Hd] -> [T, D]
@@ -124,6 +129,7 @@ impl TitansMemory {
         initial_m: &Tensor, // [H, Hd, Hd]
         etas: &Tensor,      // [H]
         decays: &Tensor,    // [H, T]
+        write_gates: &Tensor, // [H, T]
     ) -> Result<(Tensor, Tensor)> {
         let (h_size, t_size, _hd_size) = keys.dims3()?;
         let mut current_m = initial_m.clone();
@@ -151,9 +157,13 @@ impl TitansMemory {
             // 3. Delta update: ΔM = (v_t - y_t) ⊗ k_t
             let update = kt.transpose(1, 2)?.matmul(&diff)?; // [H, Hd, Hd]
 
-            // 4. Update M
+            // 4. Update M with Gated Write
             let dt = one_minus_decays.narrow(1, t, 1)?.unsqueeze(candle_core::D::Minus1)?; // [H, 1, 1]
-            let learning_rates = etas.reshape((h_size, 1, 1))?.broadcast_mul(&total_surprise)?; // [H, 1, 1]
+            let wg = write_gates.narrow(1, t, 1)?.unsqueeze(candle_core::D::Minus1)?; // [H, 1, 1]
+
+            let learning_rates = etas.reshape((h_size, 1, 1))?
+                .broadcast_mul(&total_surprise)?
+                .broadcast_mul(&wg)?; // [H, 1, 1]
 
             current_m = (current_m.broadcast_mul(&dt)? + update.broadcast_mul(&learning_rates)?)?;
         }

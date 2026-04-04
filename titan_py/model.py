@@ -30,6 +30,7 @@ class TitanTransformer:
         block_size: Optional[int] = None,
         m_size: Optional[int] = None,
         num_experts: Optional[int] = None,
+        global_attn_period: Optional[int] = None,
         use_weight_std: Optional[bool] = None,
         use_turbo_quant: Optional[bool] = None,
         drop_path_rate: Optional[float] = None,
@@ -44,6 +45,7 @@ class TitanTransformer:
             block_size,
             m_size,
             num_experts,
+            global_attn_period,
             use_weight_std,
             use_turbo_quant,
             drop_path_rate

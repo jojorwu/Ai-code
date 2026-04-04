@@ -22,10 +22,11 @@ pub struct MultiHeadAttention {
     num_kv_heads: usize,
     head_dim: usize,
     window_size: usize,
+    is_global: bool,
 }
 
 impl MultiHeadAttention {
-    pub fn new(dim: usize, num_heads: usize, num_kv_heads: usize, window_size: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn new(dim: usize, num_heads: usize, num_kv_heads: usize, window_size: usize, is_global: bool, vb: VarBuilder) -> Result<Self> {
         let head_dim = dim / num_heads;
         let q_proj = linear(dim, dim, vb.pp("q_proj"))?;
         let k_proj = linear(dim, num_kv_heads * head_dim, vb.pp("k_proj"))?;
@@ -46,6 +47,7 @@ impl MultiHeadAttention {
             num_kv_heads,
             head_dim,
             window_size,
+            is_global,
         })
     }
 
@@ -91,9 +93,9 @@ impl MultiHeadAttention {
             k = Tensor::cat(&[prev_k, k_rope], 1)?;
             v = Tensor::cat(&[prev_v, v], 1)?;
 
-            // Truncate KV-cache to window_size to manage context growth
+            // Truncate KV-cache to window_size to manage context growth (only for local layers)
             let cur_kv_len = k.dim(1)?;
-            if cur_kv_len > self.window_size {
+            if !self.is_global && cur_kv_len > self.window_size {
                  k = k.narrow(1, cur_kv_len - self.window_size, self.window_size)?;
                  v = v.narrow(1, cur_kv_len - self.window_size, self.window_size)?;
             }
@@ -152,9 +154,9 @@ impl MultiHeadAttention {
                 let i_abs = (i as i64 + kv_len as i64 - q_len as i64) as usize;
                 (0..kv_len).map(move |j| {
                     // Causal mask: j > i_abs
-                    // Sliding window: j < i_abs - window_size
+                    // Sliding window: j < i_abs - window_size (only if not global)
                     let is_causal = j > i_abs;
-                    let is_outside_window = i_abs >= self.window_size && j < i_abs - self.window_size;
+                    let is_outside_window = !self.is_global && i_abs >= self.window_size && j < i_abs - self.window_size;
 
                     if is_causal || is_outside_window {
                          f32::NEG_INFINITY

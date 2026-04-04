@@ -24,6 +24,7 @@ pub struct Config {
     pub block_size: usize,
     pub m_size: usize,
     pub num_experts: usize,
+    pub global_attn_period: usize,
     pub use_weight_std: bool,
     pub use_turbo_quant: bool,
     pub drop_path_rate: f32,
@@ -41,6 +42,7 @@ impl Default for Config {
             block_size: 4,
             m_size: 8,
             num_experts: 4,
+            global_attn_period: 4,
             use_weight_std: true,
             use_turbo_quant: false,
             drop_path_rate: 0.1,
@@ -262,6 +264,7 @@ impl TitanTransformer {
         let mut layers = Vec::with_capacity(config.num_layers);
 
         for i in 0..config.num_layers {
+            let is_global = i % config.global_attn_period == 0;
             let vb_layer = vb.pp(format!("layer_{}", i));
             layers.push(TitanLayer {
                 attention: MultiHeadAttention::new(
@@ -269,6 +272,7 @@ impl TitanTransformer {
                     config.num_heads,
                     config.num_kv_heads,
                     config.window_size,
+                    is_global,
                     vb_layer.pp("attention")
                 )?,
                 memory: TitansMemory::new(config.dim, config.num_heads, config.use_turbo_quant, vb_layer.pp("memory"))?,

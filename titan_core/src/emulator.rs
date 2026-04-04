@@ -1,5 +1,5 @@
 use candle_core::{Tensor, Result};
-use candle_nn::{VarBuilder, linear, conv1d, Conv1d, Conv1dConfig, Linear};
+use candle_nn::{VarBuilder, linear, conv1d, rms_norm, Conv1d, Conv1dConfig, Linear, RmsNorm};
 
 /// Python Emulator Module.
 ///
@@ -9,6 +9,7 @@ pub struct PythonEmulator {
     up_proj: Linear,
     down_proj: Linear,
     conv: Conv1d,
+    norm: RmsNorm,
     // GRU Gates
     update_gate: Linear,
     reset_gate: Linear,
@@ -35,6 +36,7 @@ impl PythonEmulator {
         };
         let conv = conv1d(bottleneck_dim, bottleneck_dim, 3, conv_cfg, vb.pp("conv"))?;
 
+        let norm = rms_norm(dim, 1e-5, vb.pp("norm"))?;
         let update_gate = linear(dim, dim, vb.pp("update_gate"))?;
         let reset_gate = linear(dim, dim, vb.pp("reset_gate"))?;
         let candidate_gate = linear(dim, dim, vb.pp("candidate_gate"))?;
@@ -43,6 +45,7 @@ impl PythonEmulator {
             up_proj,
             down_proj,
             conv,
+            norm,
             update_gate,
             reset_gate,
             candidate_gate,
@@ -90,6 +93,7 @@ impl PythonEmulator {
         let one_minus_z = z.neg()?.affine(1.0, 1.0)?;
         let new_state = (current_state.broadcast_mul(&one_minus_z)? + candidate.broadcast_mul(&z)?)?;
 
-        Ok(new_state)
+        // Apply state normalization for stability
+        new_state.apply(&self.norm)
     }
 }
