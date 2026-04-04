@@ -18,7 +18,10 @@ fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
 }
 
 #[pyclass]
-#[doc = "Rust-based implementation of the Titan Transformer model."]
+#[doc = "The main entry point for the Titan Transformer in Python.\n\n\
+         This class manages the lifecycle of the model, including state management\n\
+         for persistent neural memory and KV-caching. It provides high-level methods\n\
+         for forward inference and sequence training."]
 pub struct PyTitanTransformer {
     inner: TitanTransformer,
     varmap: VarMap,

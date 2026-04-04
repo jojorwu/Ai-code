@@ -9,6 +9,9 @@ class PyTitanTransformer:
         num_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         window_size: Optional[int] = None,
+        block_size: Optional[int] = None,
+        m_size: Optional[int] = None,
+        num_experts: Optional[int] = None,
     ) -> None: ...
     def init_optimizer(self, lr: float) -> None: ...
     def save_weights(self, path: str) -> None: ...

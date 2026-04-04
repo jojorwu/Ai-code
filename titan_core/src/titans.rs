@@ -19,8 +19,8 @@ pub struct TitansMemory {
     gate_proj: Linear,
     out_proj: Linear,
     surprise_proj: Linear,
+    decay_proj: Linear,
     eta: Tensor,
-    decay: Tensor,
     num_heads: usize,
     head_dim: usize,
 }
@@ -35,10 +35,10 @@ impl TitansMemory {
         let gate_proj = linear(dim, dim, vb.pp("gate_proj"))?;
         let out_proj = linear(dim, dim, vb.pp("out_proj"))?;
         let surprise_proj = linear(head_dim, 1, vb.pp("surprise_proj"))?;
+        let decay_proj = linear(dim, num_heads, vb.pp("decay_proj"))?;
 
         // Per-head learnable parameters [H]
         let eta = vb.get((num_heads,), "eta")?;
-        let decay = vb.get((num_heads,), "decay")?;
 
         Ok(Self {
             key_proj,
@@ -46,8 +46,8 @@ impl TitansMemory {
             gate_proj,
             out_proj,
             surprise_proj,
+            decay_proj,
             eta,
-            decay,
             num_heads,
             head_dim,
         })
@@ -81,7 +81,9 @@ impl TitansMemory {
 
         // Hyperparameters for the Delta-rule (learnable per-head, vectorized)
         let etas = (ops::sigmoid(&self.eta)? * 0.5)?;
-        let decays = (ops::sigmoid(&self.decay)? * 0.1)?;
+        // Dynamic context-aware decay [T, H]
+        let decays = (ops::sigmoid(&x.apply(&self.decay_proj)?)? * 0.1)?;
+        let decays = decays.transpose(0, 1)?; // [H, T]
 
         let mut new_m_list = Vec::with_capacity(self.num_heads);
         let mut final_head_outputs = Vec::with_capacity(self.num_heads);
@@ -94,7 +96,7 @@ impl TitansMemory {
             let mh = memory_matrices.get(h)?; // [Hd, Hd]
 
             let eta_h = etas.get(h)?; // [1]
-            let decay_h = decays.get(h)?; // [1]
+            let decay_h = decays.get(h)?; // [T]
 
             let (y_h, m_h_new) = self.update_memory_loop(&kh, &vh, &gh, &mh, &eta_h, &decay_h)?;
 
@@ -112,13 +114,14 @@ impl TitansMemory {
 
     /// Performs iterative memory updates using the Delta-rule for a single head.
     ///
-    /// The update rule follows the Least Mean Squares (LMS) / Delta-rule:
-    /// $$ M_t = (1 - \text{decay}) M_{t-1} + \eta \cdot \text{surprise} \cdot ((v_t - y_t) \otimes k_t) $$
+    /// The update rule follows the Least Mean Squares (LMS) / Delta-rule with dynamic decay:
+    /// $$ M_t = (1 - \text{decay}_t) M_{t-1} + \eta \cdot \text{surprise}_t \cdot ((v_t - y_t) \otimes k_t) $$
     /// where:
     /// - $y_t = k_t M_{t-1}$ is the value retrieved from the associative memory.
     /// - $v_t - y_t$ is the prediction error (surprise vector).
-    /// - $\eta$ is the learning rate (step size).
-    /// - $\otimes$ denotes the outer product.
+    /// - $\eta$ is the base learning rate for memory updates.
+    /// - $\text{surprise}_t$ is the learnable gating factor predicted from retrieval error.
+    /// - $\text{decay}_t$ is the context-aware forgetting factor.
     fn update_memory_loop(
         &self,
         keys: &Tensor,
@@ -159,10 +162,11 @@ impl TitansMemory {
             // 3. Delta update: ΔM = (v_t - y_t) ⊗ k_t
             let update = kt.t()?.matmul(&diff)?;
 
-            // 4. Update M: M_t = (1 - decay) * M_{t-1} + (eta * surprise) * ΔM
+            // 4. Update M: M_t = (1 - decay_t) * M_{t-1} + (eta * surprise) * ΔM
             let gated_eta_val = (eta_val as f64 * gt) as f32;
+            let dt = one_minus_decay.narrow(0, t, 1)?; // [1]
             current_m = current_m
-                .broadcast_mul(&one_minus_decay)?
+                .broadcast_mul(&dt)?
                 .broadcast_add(&update.affine(gated_eta_val as f64, 0.0)?)?;
         }
 

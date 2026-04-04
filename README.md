@@ -5,11 +5,12 @@ Titan is a neural network project implementing the "Titans" architecture, which 
 ## Architecture
 
 The Titan architecture consists of:
-- **Neural Long-Term Memory (TitansMemory):** A persistent matrix-based memory that uses an iterative Delta-rule update with surprise-based gating and decay to memorize historical context.
-- **Python Emulator (PythonEmulator):** A module that models internal program state updates using a gated MLP based on input sequences.
-- **Attention Residuals (FullAttnRes/BlockAttnRes):** A mechanism to aggregate outputs from all previous layers using a learned pseudo-attention mechanism.
-- **PolarQuant:** A quantization technique that separates magnitude (radius) and direction for efficient representation.
-- **Standard Transformer Layers:** Incorporating RMSNorm, Feed-Forward Networks (FFN), and a pre-norm residual structure.
+- **Neural Long-Term Memory (TitansMemory):** A persistent matrix-based memory using a Multi-Head Delta-rule update with learnable "surprise" gating and context-aware decay.
+- **Sliding Window Attention (SWA):** Optimized Grouped-Query Attention (GQA) with a 512-token local window and 8-bit quantized KV-cache for linear context efficiency.
+- **Sparse Mixture of Experts (MoE):** High-capacity FFN replacement featuring dynamic Top-1 routing and a Shared Expert for improved performance/parameter ratio.
+- **Python Emulator (PythonEmulator):** Models internal program state updates using a bottleneck GRU mechanism for semantic instruction processing.
+- **Block Attention Residuals:** Vectorized Mini-Cross-Attention mechanism to aggregate information across layer blocks.
+- **Modern Refinements:** NTK-aware RoPE scaling (base 50,000), LayerScale, learnable Logit Softcapping, and weight tying.
 
 ## Components
 

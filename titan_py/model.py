@@ -3,7 +3,21 @@ from ._titan_core import PyTitanTransformer, PyTokenizer
 
 class TitanTransformer:
     """
-    High-level wrapper for the Titan model.
+    High-level wrapper for the Titan Transformer model.
+
+    This class provides a user-friendly interface to the underlying Rust implementation,
+    managing long-term memory states and KV-caches automatically.
+
+    Args:
+        vocab_size (int): Size of the vocabulary.
+        dim (int): Hidden dimension of the model.
+        num_layers (int): Number of Transformer layers.
+        num_heads (int, optional): Number of attention heads. Defaults to 8.
+        num_kv_heads (int, optional): Number of KV heads for GQA. Defaults to 2.
+        window_size (int, optional): Size of the sliding attention window. Defaults to 512.
+        block_size (int, optional): Number of layers per residual block. Defaults to 4.
+        m_size (int, optional): Number of persistent memory tokens. Defaults to 8.
+        num_experts (int, optional): Number of dynamic experts in MoE. Defaults to 4.
     """
     def __init__(
         self,

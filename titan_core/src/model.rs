@@ -142,13 +142,17 @@ impl MoE {
         // 2. Dynamic Experts (Top-1 routing)
         let expert_indices = router_logits.argmax(candle_core::D::Minus1)?;
 
+        // Implement Expert Routing logic (Top-1)
+        // Selection: expert_i = argmax(router(x))
+        // Final Output: y = shared_expert(x) + routing_weights[expert_i] * expert_i(x)
         for i in 0..self.num_experts {
             let expert_out = self.experts[i].forward(x)?;
 
-            // Mask: 1.0 if expert_indices == i, 0.0 otherwise
+            // Generate binary mask for expert selection [T, 1]
             let mask = expert_indices.eq(i as u32)?.unsqueeze(candle_core::D::Minus1)?;
             let weight = routing_weights.narrow(candle_core::D::Minus1, i, 1)?;
 
+            // Apply gating: mask * softmax_weight
             let combined_gate = (mask.to_dtype(candle_core::DType::F32)?.broadcast_mul(&weight))?.to_dtype(x.dtype())?;
 
             final_output = (final_output + expert_out.broadcast_mul(&combined_gate)?)?;

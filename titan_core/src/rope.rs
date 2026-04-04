@@ -1,5 +1,11 @@
+//! Rotary Positional Embeddings (RoPE) with NTK-aware scaling.
+//!
+//! This module implements relative positional information injection
+//! for multi-head attention and long-term memory.
+
 use candle_core::{D, Device, Result, Tensor};
 
+/// Rotary Positional Embedding (RoPE) implementation.
 pub struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
@@ -29,8 +35,14 @@ impl RotaryEmbedding {
         Ok(Self { sin, cos })
     }
 
+    /// Applies Rotary Positional Embeddings to the input tensor.
+    ///
+    /// $$ \text{RoPE}(x, \text{pos}) = x \cdot \cos(\theta_{\text{pos}}) + \text{rotate\_half}(x) \cdot \sin(\theta_{\text{pos}}) $$
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor of shape [..., T, D].
+    /// * `start_pos` - The starting index in the sequence for positional information.
     pub fn apply(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
-        // x: [..., T, D]
         let dims = x.dims();
         let t_size = dims[dims.len() - 2];
         let d_size = dims[dims.len() - 1];

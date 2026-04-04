@@ -1,8 +1,13 @@
+//! Block Attention Residuals for cross-layer information aggregation.
+//!
+//! This module implements a Mini-Cross-Attention mechanism that allows
+//! deeper layers to attend to summarized representations of previous layer blocks.
+
 use candle_core::{Tensor, Result, D};
 use candle_nn::{VarBuilder, linear, Linear};
 use crate::rope::RotaryEmbedding;
 
-/// Block Attention Residuals.
+/// Block Attention Residuals (BAR) implementation.
 /// Aggregates outputs from completed blocks and current local states.
 pub struct BlockAttnRes {
     q_proj: Linear,
@@ -21,7 +26,10 @@ impl BlockAttnRes {
         Ok(Self { q_proj, k_proj, v_proj, out_proj })
     }
 
-    /// Performs the forward pass using cross-attention over block outputs.
+    /// Performs the forward pass using cross-attention over summarized block outputs.
+    ///
+    /// This allows the model to maintain a "global view" across layers by
+    /// attending to compressed historical states from earlier layer blocks.
     pub fn forward(&self, states: &[Tensor], current: &Tensor, rope: &RotaryEmbedding, start_pos: usize) -> Result<Tensor> {
         if states.is_empty() {
             return Ok(current.clone());

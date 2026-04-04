@@ -16,6 +16,10 @@ pub struct PythonEmulator {
 
 impl PythonEmulator {
     /// Creates a new `PythonEmulator` instance with a bottleneck GRU state update.
+    ///
+    /// The bottleneck design (dim -> dim/4 -> dim) ensures that the emulator
+    /// extracts only the most salient "instruction" features from the hidden state,
+    /// preventing the program state from being saturated by noise.
     pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
         // Bottleneck: compress information to captue higher-level instruction semantics
         let up_proj = linear(dim, dim / 4, vb.pp("up_proj"))?;
@@ -34,7 +38,16 @@ impl PythonEmulator {
         })
     }
 
-    /// Updates the persistent internal program state using a GRU mechanism.
+    /// Updates the persistent internal program state using a Gated Recurrent Unit (GRU) mechanism.
+    ///
+    /// The state update follows:
+    /// 1. Instruction extraction via bottleneck MLP.
+    /// 2. Mean aggregation over the sequence dimension (T).
+    /// 3. GRU state transition:
+    ///    $$ z_t = \sigma(W_z x_t + U_z h_{t-1}) $$
+    ///    $$ r_t = \sigma(W_r x_t + U_r h_{t-1}) $$
+    ///    $$ \tilde{h}_t = \tanh(W_h x_t + r_t \odot (U_h h_{t-1})) $$
+    ///    $$ h_t = (1 - z_t) \odot h_{t-1} + z_t \odot \tilde{h}_t $$
     pub fn step(&self, instruction_rep: &Tensor, current_state: &Tensor) -> Result<Tensor> {
         // instruction_rep: [T, D]
         // Use MLP to process instructions

@@ -1,3 +1,7 @@
+//! Quantization utilities for the Titan model.
+//!
+//! Includes PolarQuant for magnitude/direction separation and QJL for 1-bit quantization.
+
 use candle_core::{Tensor, Result, D};
 
 /// PolarQuant separates magnitude (radius) and normalized direction.
@@ -5,6 +9,8 @@ pub struct PolarQuant;
 
 impl PolarQuant {
     /// Compresses a tensor into its magnitude (radius) and normalized direction.
+    ///
+    /// $$ r = \|x\|_2, \quad \hat{x} = \frac{x}{r + \epsilon} $$
     /// Uses an epsilon to avoid division by zero when calculating the direction.
     pub fn compress(x: &Tensor) -> Result<(Tensor, Tensor)> {
         // Compute the norm (radius) and normalized direction (angle-like)
