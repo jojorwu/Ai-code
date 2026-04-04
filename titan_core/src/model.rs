@@ -28,6 +28,9 @@ pub struct Config {
     pub use_weight_std: bool,
     pub use_turbo_quant: bool,
     pub use_differential_attn: bool,
+    pub use_mla: bool,
+    pub kv_lora_rank: usize,
+    pub qk_lora_rank: usize,
     pub drop_path_rate: f32,
 }
 
@@ -47,6 +50,9 @@ impl Default for Config {
             use_weight_std: true,
             use_turbo_quant: false,
             use_differential_attn: false,
+            use_mla: false,
+            kv_lora_rank: 512,
+            qk_lora_rank: 128,
             drop_path_rate: 0.1,
         }
     }
@@ -276,6 +282,9 @@ impl TitanTransformer {
                     config.window_size,
                     is_global,
                     config.use_differential_attn,
+                    config.use_mla,
+                    config.kv_lora_rank,
+                    config.qk_lora_rank,
                     vb_layer.pp("attention")
                 )?,
                 memory: TitansMemory::new(config.dim, config.num_heads, config.use_turbo_quant, vb_layer.pp("memory"))?,

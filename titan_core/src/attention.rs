@@ -26,6 +26,14 @@ pub struct MultiHeadAttention {
     use_differential: bool,
     lambda_1: Option<Tensor>,
     lambda_2: Option<Tensor>,
+    // MLA (Multi-Head Latent Attention)
+    use_mla: bool,
+    kv_down_proj: Option<Linear>,
+    kv_up_proj: Option<Linear>,
+    q_down_proj: Option<Linear>,
+    q_up_proj: Option<Linear>,
+    kv_norm: Option<RmsNorm>,
+    q_norm_mla: Option<RmsNorm>,
 }
 
 impl MultiHeadAttention {
@@ -36,12 +44,34 @@ impl MultiHeadAttention {
         window_size: usize,
         is_global: bool,
         use_differential: bool,
+        use_mla: bool,
+        kv_lora_rank: usize,
+        qk_lora_rank: usize,
         vb: VarBuilder
     ) -> Result<Self> {
         let head_dim = dim / num_heads;
-        let q_proj = linear(dim, dim, vb.pp("q_proj"))?;
-        let k_proj = linear(dim, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear(dim, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+
+        let (q_proj, k_proj, v_proj, kv_down_proj, kv_up_proj, q_down_proj, q_up_proj, kv_norm, q_norm_mla) = if use_mla {
+             let q_down = linear(dim, qk_lora_rank, vb.pp("q_down_proj"))?;
+             let q_up = linear(qk_lora_rank, dim, vb.pp("q_up_proj"))?;
+             let kv_down = linear(dim, kv_lora_rank, vb.pp("kv_down_proj"))?;
+             let kv_up = linear(kv_lora_rank, num_kv_heads * head_dim * 2, vb.pp("kv_up_proj"))?;
+             let kv_norm = rms_norm(kv_lora_rank, 1e-5, vb.pp("kv_norm"))?;
+             let q_norm_mla = rms_norm(qk_lora_rank, 1e-5, vb.pp("q_norm_mla"))?;
+
+             // In MLA, we don't use direct QKV projs usually, but we keep structure
+             let dummy_q = linear(dim, dim, vb.pp("q_proj"))?;
+             let dummy_k = linear(dim, num_kv_heads * head_dim, vb.pp("k_proj"))?;
+             let dummy_v = linear(dim, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+
+             (dummy_q, dummy_k, dummy_v, Some(kv_down), Some(kv_up), Some(q_down), Some(q_up), Some(kv_norm), Some(q_norm_mla))
+        } else {
+             let q_proj = linear(dim, dim, vb.pp("q_proj"))?;
+             let k_proj = linear(dim, num_kv_heads * head_dim, vb.pp("k_proj"))?;
+             let v_proj = linear(dim, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+             (q_proj, k_proj, v_proj, None, None, None, None, None, None)
+        };
+
         let out_proj = linear(dim, dim, vb.pp("out_proj"))?;
 
         let (q_norm, k_norm, lambda_1, lambda_2) = if use_differential {
@@ -72,6 +102,13 @@ impl MultiHeadAttention {
             use_differential,
             lambda_1,
             lambda_2,
+            use_mla,
+            kv_down_proj,
+            kv_up_proj,
+            q_down_proj,
+            q_up_proj,
+            kv_norm,
+            q_norm_mla,
         })
     }
 
@@ -92,9 +129,26 @@ impl MultiHeadAttention {
     ) -> Result<(Tensor, (Tensor, Tensor))> {
         let (t_size, _d_size) = x.dims2()?;
 
-        let mut q = x.apply(&self.q_proj)?;
-        let mut k = x.apply(&self.k_proj)?;
-        let mut v = x.apply(&self.v_proj)?;
+        let mut q: Tensor;
+        let mut k: Tensor;
+        let mut v: Tensor;
+
+        if self.use_mla {
+             // 1. Latent compression
+             let kv_latent = x.apply(self.kv_down_proj.as_ref().unwrap())?.apply(self.kv_norm.as_ref().unwrap())?;
+             let kv_full = kv_latent.apply(self.kv_up_proj.as_ref().unwrap())?; // [T, Hkv * Hd * 2]
+
+             let split_size = self.num_kv_heads * self.head_dim;
+             k = kv_full.narrow(D::Minus1, 0, split_size)?;
+             v = kv_full.narrow(D::Minus1, split_size, split_size)?;
+
+             let q_latent = x.apply(self.q_down_proj.as_ref().unwrap())?.apply(self.q_norm_mla.as_ref().unwrap())?;
+             q = q_latent.apply(self.q_up_proj.as_ref().unwrap())?;
+        } else {
+             q = x.apply(&self.q_proj)?;
+             k = x.apply(&self.k_proj)?;
+             v = x.apply(&self.v_proj)?;
+        }
 
         // Reshape for GQA: q: [H, T, Hd], k/v: [Hkv, T, Hd]
         q = q.reshape((t_size, self.num_heads, self.head_dim))?.transpose(0, 1)?;
