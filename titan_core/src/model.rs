@@ -1,13 +1,50 @@
+//! Main architecture definition for the Titan Transformer.
+//!
+//! Titan is a hybrid model combining Self-Attention, Neural Long-Term Memory (Titans),
+//! and a Program Emulator in a parallel residual structure.
+
 use candle_core::{Tensor, Result};
 use candle_nn::{embedding, linear, rms_norm, conv1d, Conv1d, Conv1dConfig, Embedding, Linear, RmsNorm, VarBuilder, Init};
+use serde::{Serialize, Deserialize};
 use crate::attention::MultiHeadAttention;
 use crate::titans::TitansMemory;
 use crate::emulator::PythonEmulator;
 use crate::quant::PolarQuant;
 use crate::rope::RotaryEmbedding;
 
+/// Architectural configuration for the Titan Transformer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Config {
+    pub vocab_size: usize,
+    pub dim: usize,
+    pub num_layers: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub window_size: usize,
+    pub block_size: usize,
+    pub m_size: usize,
+    pub num_experts: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            vocab_size: 32000,
+            dim: 768,
+            num_layers: 12,
+            num_heads: 12,
+            num_kv_heads: 4,
+            window_size: 512,
+            block_size: 4,
+            m_size: 8,
+            num_experts: 4,
+        }
+    }
+}
+
 /// Main Titan Transformer model.
 pub struct TitanTransformer {
+    pub config: Config,
     embedding: Embedding,
     layers: Vec<TitanLayer>,
     norm_final: RmsNorm,
@@ -16,7 +53,6 @@ pub struct TitanTransformer {
     logit_cap: Tensor,
     memory_tokens: Tensor,
     block_attn_res: crate::attn_res::BlockAttnRes,
-    block_size: usize,
 }
 
 /// Feed-Forward Network (FFN) block using SwiGLU activation and depthwise Conv1D.
@@ -69,7 +105,7 @@ impl FFN {
     }
 }
 
-/// Sparse Mixture of Experts (MoE) block with a Shared Expert.
+/// Sparse Mixture of Experts (MoE) block with a Shared Expert and Top-1 routing.
 pub struct MoE {
     router: Linear,
     experts: Vec<FFN>,
@@ -148,37 +184,43 @@ pub struct TitanLayer {
 }
 
 impl TitanTransformer {
-    /// Creates a new Titan Transformer model.
-    pub fn new(vocab_size: usize, dim: usize, num_layers: usize, vb: VarBuilder) -> Result<Self> {
-        let embedding = embedding(vocab_size, dim, vb.pp("embedding"))?;
-        let rope = RotaryEmbedding::new(dim, 8192, vb.device())?;
-        let mut layers = Vec::with_capacity(num_layers);
-        let block_size = 4;
-        let window_size = 512;
-        for i in 0..num_layers {
+    /// Creates a new Titan Transformer model with a configuration struct.
+    pub fn new(config: Config, vb: VarBuilder) -> Result<Self> {
+        let embedding = embedding(config.vocab_size, config.dim, vb.pp("embedding"))?;
+        let rope = RotaryEmbedding::new(config.dim, 8192, vb.device())?;
+        let mut layers = Vec::with_capacity(config.num_layers);
+
+        for i in 0..config.num_layers {
             let vb_layer = vb.pp(format!("layer_{}", i));
             layers.push(TitanLayer {
-                attention: MultiHeadAttention::new(dim, 8, 2, window_size, vb_layer.pp("attention"))?, // GQA with 2 KV heads
-                memory: TitansMemory::new(dim, vb_layer.pp("memory"))?,
-                emulator: PythonEmulator::new(dim, vb_layer.pp("emulator"))?,
-                moe: MoE::new(dim, 4, vb_layer.pp("moe"))?, // 4 experts + shared expert
-                norm_1: rms_norm(dim, 1e-5, vb_layer.pp("norm_1"))?,
-                norm_2: rms_norm(dim, 1e-5, vb_layer.pp("norm_2"))?,
-                gate_net: linear(dim, 3, vb_layer.pp("gate_net"))?,
-                layerscale_1: vb_layer.get_with_hints((dim,), "layerscale_1", Init::Const(0.1))?,
-                layerscale_2: vb_layer.get_with_hints((dim,), "layerscale_2", Init::Const(0.1))?,
+                attention: MultiHeadAttention::new(
+                    config.dim,
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.window_size,
+                    vb_layer.pp("attention")
+                )?,
+                memory: TitansMemory::new(config.dim, config.num_heads, vb_layer.pp("memory"))?,
+                emulator: PythonEmulator::new(config.dim, vb_layer.pp("emulator"))?,
+                moe: MoE::new(config.dim, config.num_experts, vb_layer.pp("moe"))?,
+                norm_1: rms_norm(config.dim, 1e-5, vb_layer.pp("norm_1"))?,
+                norm_2: rms_norm(config.dim, 1e-5, vb_layer.pp("norm_2"))?,
+                gate_net: linear(config.dim, 3, vb_layer.pp("gate_net"))?,
+                layerscale_1: vb_layer.get_with_hints((config.dim,), "layerscale_1", Init::Const(0.1))?,
+                layerscale_2: vb_layer.get_with_hints((config.dim,), "layerscale_2", Init::Const(0.1))?,
             });
         }
-        let norm_final = rms_norm(dim, 1e-5, vb.pp("norm_final"))?;
+        let norm_final = rms_norm(config.dim, 1e-5, vb.pp("norm_final"))?;
         let logit_cap = vb.get_with_hints((1,), "logit_cap", Init::Const(2.0))?;
-        let memory_tokens = vb.get((8, dim), "memory_tokens")?; // 8 persistent memory tokens
-        let block_attn_res = crate::attn_res::BlockAttnRes::new(dim, vb.pp("block_attn_res"))?;
+        let memory_tokens = vb.get((config.m_size, config.dim), "memory_tokens")?;
+        let block_attn_res = crate::attn_res::BlockAttnRes::new(config.dim, vb.pp("block_attn_res"))?;
 
         // Weight Tying: The output layer shares weights with the embedding layer
         let output_weights = embedding.embeddings().clone();
         let output = Linear::new(output_weights, None); // No bias for weight tying usually
 
         Ok(Self {
+            config,
             embedding,
             layers,
             norm_final,
@@ -187,7 +229,6 @@ impl TitanTransformer {
             logit_cap,
             memory_tokens,
             block_attn_res,
-            block_size,
         })
     }
 
@@ -200,89 +241,108 @@ impl TitanTransformer {
         program_states: &mut [Tensor],
         kv_caches: &mut [Option<(Tensor, Tensor)>],
     ) -> Result<(Tensor, Tensor)> {
-        let mut h = x.apply(&self.embedding)?;
-        let device = h.device();
-        let mut total_aux_loss = Tensor::new(0f32, device)?;
+        let (mut h, start_pos) = self.prepare_input(x, kv_caches)?;
+        let mut total_aux_loss = Tensor::new(0f32, h.device())?;
 
-        // Detect if we are in incremental generation mode (using KV-cache)
-        let kv_len = if let Some(cache) = &kv_caches[0] {
-            cache.0.dim(1)?
-        } else {
-            0
-        };
-        let is_incremental = kv_len > 0;
-        let _m_size = self.memory_tokens.dim(0)?;
-
-        // Prepend persistent memory tokens ONLY if we are at the start of a sequence
-        if !is_incremental {
-             h = Tensor::cat(&[&self.memory_tokens, &h], 0)?;
-        }
-
-        let start_pos = if is_incremental {
-            kv_len // kv_len already includes memory tokens from the prefill stage
-        } else {
-            0 // The combined tensor [memory_tokens, h] starts at 0
-        };
-
-        let mut local_history = Vec::with_capacity(self.block_size);
-        let mut block_summaries = Vec::with_capacity(self.layers.len() / self.block_size + 1);
+        let mut local_history = Vec::with_capacity(self.config.block_size);
+        let mut block_summaries = Vec::with_capacity(self.layers.len() / self.config.block_size + 1);
 
         for (i, layer) in self.layers.iter().enumerate() {
-            // Parallel Block Architecture:
-            // h = h + SelfAttn(Norm(h)) + Memory(Norm(h)) + Emulator(Norm(h))
-            let h_norm = h.apply(&layer.norm_1)?;
+            let (h_next, aux_loss) = self.apply_layer(
+                layer,
+                &h,
+                &mut memory_states[i],
+                &mut program_states[i],
+                &mut kv_caches[i],
+                &block_summaries,
+                start_pos
+            )?;
 
-            // 1. Self-Attention with KV-Cache
-            let (attn_out, new_kv) = layer.attention.forward(&h_norm, &self.rope, kv_caches[i].clone(), start_pos)?;
-            kv_caches[i] = Some(new_kv);
-
-            // 2. Neural Memory (Full sequence context)
-            let (radius, direction) = PolarQuant::compress(&h_norm)?;
-            let h_quantized = PolarQuant::decompress(&radius, &direction)?;
-            let (mem_out, new_mem) = layer.memory.forward(&h_quantized, &memory_states[i], &self.rope, start_pos)?;
-            memory_states[i] = new_mem;
-
-            // 3. Program Emulator
-            let new_prog = layer.emulator.step(&h_quantized, &program_states[i])?;
-            program_states[i] = new_prog.clone();
-
-            // Aggregate parallel components with dynamic gating
-            let gates = h_norm.apply(&layer.gate_net)?;
-            let gates = candle_nn::ops::softmax(&gates, candle_core::D::Minus1)?;
-
-            let g_attn = gates.narrow(candle_core::D::Minus1, 0, 1)?;
-            let g_mem = gates.narrow(candle_core::D::Minus1, 1, 1)?;
-            let g_emu = gates.narrow(candle_core::D::Minus1, 2, 1)?;
-
-            let mut parallel_out = attn_out.broadcast_mul(&g_attn)?;
-            parallel_out = (parallel_out + mem_out.broadcast_mul(&g_mem)?)?;
-            // new_prog: [1, D], g_emu: [T, 1]
-            parallel_out = (parallel_out + new_prog.broadcast_mul(&g_emu)?)?;
-
-            // 4. Block Attention Residuals
-            let attn_res_out = self.block_attn_res.forward(&block_summaries, &parallel_out, &self.rope, start_pos)?;
-
-            h = (h + attn_res_out.broadcast_mul(&layer.layerscale_1)?)?;
-
-            // Sequential Block: MoE Feed-Forward
-            let h_ffn_norm = h.apply(&layer.norm_2)?;
-            let (moe_out, aux_loss) = layer.moe.forward(&h_ffn_norm)?;
+            h = h_next;
             total_aux_loss = (total_aux_loss + aux_loss)?;
-            h = (h + moe_out.broadcast_mul(&layer.layerscale_2)?)?;
 
-            // Manage history for Block Attention Residuals
+            // Manage block history
             local_history.push(h.clone());
-            if local_history.len() == self.block_size {
-                 // Block completed: summarize block (e.g. mean of local history)
+            if local_history.len() == self.config.block_size {
                  let block_summary = (Tensor::stack(&local_history, 0)?.mean(0))?;
                  block_summaries.push(block_summary);
                  local_history.clear();
             }
         }
 
+        self.post_process(&h, total_aux_loss)
+    }
+
+    /// Prepares input by applying embedding and prepending memory tokens if necessary.
+    fn prepare_input(&self, x: &Tensor, kv_caches: &[Option<(Tensor, Tensor)>]) -> Result<(Tensor, usize)> {
+        let mut h = x.apply(&self.embedding)?;
+        let kv_len = if let Some(cache) = &kv_caches[0] {
+            cache.0.dim(1)?
+        } else {
+            0
+        };
+        let is_incremental = kv_len > 0;
+
+        if !is_incremental {
+             h = Tensor::cat(&[&self.memory_tokens, &h], 0)?;
+        }
+
+        let start_pos = if is_incremental { kv_len } else { 0 };
+        Ok((h, start_pos))
+    }
+
+    /// Applies a single Titan layer.
+    fn apply_layer(
+        &self,
+        layer: &TitanLayer,
+        h: &Tensor,
+        memory_state: &mut Tensor,
+        program_state: &mut Tensor,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+        block_summaries: &[Tensor],
+        start_pos: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let h_norm = h.apply(&layer.norm_1)?;
+
+        // 1. Parallel Branches
+        let (attn_out, new_kv) = layer.attention.forward(&h_norm, &self.rope, kv_cache.clone(), start_pos)?;
+        *kv_cache = Some(new_kv);
+
+        let (radius, direction) = PolarQuant::compress(&h_norm)?;
+        let h_quantized = PolarQuant::decompress(&radius, &direction)?;
+        let (mem_out, new_mem) = layer.memory.forward(&h_quantized, memory_state, &self.rope, start_pos)?;
+        *memory_state = new_mem;
+
+        let new_prog = layer.emulator.step(&h_quantized, program_state)?;
+        *program_state = new_prog.clone();
+
+        // 2. Dynamic Aggregation
+        let gates = h_norm.apply(&layer.gate_net)?;
+        let gates = candle_nn::ops::softmax(&gates, candle_core::D::Minus1)?;
+        let g_attn = gates.narrow(candle_core::D::Minus1, 0, 1)?;
+        let g_mem = gates.narrow(candle_core::D::Minus1, 1, 1)?;
+        let g_emu = gates.narrow(candle_core::D::Minus1, 2, 1)?;
+
+        let mut parallel_out = attn_out.broadcast_mul(&g_attn)?;
+        parallel_out = (parallel_out + mem_out.broadcast_mul(&g_mem)?)?;
+        parallel_out = (parallel_out + new_prog.broadcast_mul(&g_emu)?)?;
+
+        // 3. Block Residuals
+        let attn_res_out = self.block_attn_res.forward(block_summaries, &parallel_out, &self.rope, start_pos)?;
+        let mut h = (h + attn_res_out.broadcast_mul(&layer.layerscale_1)?)?;
+
+        // 4. Sequential MoE
+        let h_ffn_norm = h.apply(&layer.norm_2)?;
+        let (moe_out, aux_loss) = layer.moe.forward(&h_ffn_norm)?;
+        h = (h + moe_out.broadcast_mul(&layer.layerscale_2)?)?;
+
+        Ok((h, aux_loss))
+    }
+
+    /// Final normalization, softcapping, and output projection.
+    fn post_process(&self, h: &Tensor, total_aux_loss: Tensor) -> Result<(Tensor, Tensor)> {
         let h = h.apply(&self.norm_final)?;
 
-        // Skip memory tokens for output projection
         let m_size = self.memory_tokens.dim(0)?;
         let total_size = h.dim(0)?;
         let h_output = if total_size > m_size {
@@ -292,11 +352,7 @@ impl TitanTransformer {
         };
 
         let logits = h_output.apply(&self.output)?;
-
-        // Learnable Logit Softcapping (vectorized)
-        // softplus: ln(1 + exp(x))
         let cap = (self.logit_cap.exp()?.affine(1.0, 1.0)?.log()? + 1.0)?;
-
         let softcapped = logits.broadcast_div(&cap)?.tanh()?;
         Ok((softcapped.broadcast_mul(&cap)?, total_aux_loss))
     }

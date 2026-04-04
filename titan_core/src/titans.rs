@@ -1,3 +1,9 @@
+//! Titans Neural Memory: Learning to Memorize at Test Time.
+//!
+//! This module implements a matrix-based long-term associative memory.
+//! It uses an iterative Delta-rule to update the memory matrix `M`
+//! and a "surprise" gating mechanism to determine when to update.
+
 use candle_core::{Tensor, Result};
 use candle_nn::{VarBuilder, linear, Linear, ops};
 use crate::rope::RotaryEmbedding;
@@ -21,8 +27,7 @@ pub struct TitansMemory {
 
 impl TitansMemory {
     /// Creates a new `TitansMemory` instance.
-    pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let num_heads = 8; // Default to 8 heads
+    pub fn new(dim: usize, num_heads: usize, vb: VarBuilder) -> Result<Self> {
         let head_dim = dim / num_heads;
 
         let key_proj = linear(dim, dim, vb.pp("key_proj"))?;
@@ -105,7 +110,15 @@ impl TitansMemory {
         Ok((output, updated_memory))
     }
 
-    /// Helper to perform iterative memory updates (Delta-rule) for a single head.
+    /// Performs iterative memory updates using the Delta-rule for a single head.
+    ///
+    /// The update rule follows the Least Mean Squares (LMS) / Delta-rule:
+    /// $$ M_t = (1 - \text{decay}) M_{t-1} + \eta \cdot \text{surprise} \cdot ((v_t - y_t) \otimes k_t) $$
+    /// where:
+    /// - $y_t = k_t M_{t-1}$ is the value retrieved from the associative memory.
+    /// - $v_t - y_t$ is the prediction error (surprise vector).
+    /// - $\eta$ is the learning rate (step size).
+    /// - $\otimes$ denotes the outer product.
     fn update_memory_loop(
         &self,
         keys: &Tensor,

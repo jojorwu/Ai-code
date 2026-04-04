@@ -1,7 +1,16 @@
+//! Multi-Head Attention implementation with Grouped-Query Attention (GQA) and Sliding Window.
+//!
+//! This module implements the attention mechanism used in Titan, featuring:
+//! - GQA for efficient inference.
+//! - Sliding Window Attention (SWA) for linear complexity relative to context window.
+//! - KV-Cache with simulated 8-bit quantization.
+//! - Query-Key Normalization (QK-Norm) for training stability.
+
 use candle_core::{D, Result, Tensor};
 use candle_nn::{linear, rms_norm, Linear, RmsNorm, VarBuilder};
 use crate::rope::RotaryEmbedding;
 
+/// Multi-Head Attention block.
 pub struct MultiHeadAttention {
     q_proj: Linear,
     k_proj: Linear,
@@ -40,6 +49,13 @@ impl MultiHeadAttention {
         })
     }
 
+    /// Performs the forward pass with Grouped-Query Attention, RoPE, and Sliding Window.
+    ///
+    /// Implementation details:
+    /// - **QK-Norm**: Stabilizes scores by applying RMSNorm to Query and Key heads.
+    /// - **RoPE**: Injects relative positional information using NTK-aware scaling.
+    /// - **KV-Cache**: Implements a sliding window of size $W$ by truncating history.
+    /// - **Complexity**: Reduces attention complexity to $O(N \cdot W)$.
     pub fn forward(
         &self,
         x: &Tensor,

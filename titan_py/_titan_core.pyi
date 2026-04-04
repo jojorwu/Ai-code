@@ -1,7 +1,15 @@
-from typing import List
+from typing import List, Optional
 
 class PyTitanTransformer:
-    def __init__(self, vocab_size: int, dim: int, num_layers: int) -> None: ...
+    def __init__(
+        self,
+        vocab_size: int,
+        dim: int,
+        num_layers: int,
+        num_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+        window_size: Optional[int] = None,
+    ) -> None: ...
     def init_optimizer(self, lr: float) -> None: ...
     def save_weights(self, path: str) -> None: ...
     def load_weights(self, path: str) -> None: ...

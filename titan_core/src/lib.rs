@@ -8,7 +8,7 @@ pub mod model;
 
 use candle_core::{Device, Tensor, DType, Shape};
 use candle_nn::{VarBuilder, VarMap, Optimizer, AdamW, ParamsAdamW};
-use crate::model::TitanTransformer;
+use crate::model::{TitanTransformer, Config};
 use pyo3::prelude::*;
 use tokenizers::Tokenizer;
 
@@ -22,8 +22,7 @@ fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
 pub struct PyTitanTransformer {
     inner: TitanTransformer,
     varmap: VarMap,
-    dim: usize,
-    num_layers: usize,
+    config: Config,
     memory_states: Vec<Tensor>,
     program_states: Vec<Tensor>,
     kv_caches: Vec<Option<(Tensor, Tensor)>>,
@@ -33,32 +32,59 @@ pub struct PyTitanTransformer {
 #[pymethods]
 impl PyTitanTransformer {
     #[new]
-    #[doc = "Initializes a new Titan Transformer with the given vocabulary size, dimension, and number of layers."]
-    fn new(vocab_size: usize, dim: usize, num_layers: usize) -> PyResult<Self> {
+    #[pyo3(signature = (vocab_size, dim, num_layers, num_heads=None, num_kv_heads=None, window_size=None, block_size=None, m_size=None, num_experts=None))]
+    #[doc = "Initializes a new Titan Transformer with advanced configuration."]
+    fn new(
+        vocab_size: usize,
+        dim: usize,
+        num_layers: usize,
+        num_heads: Option<usize>,
+        num_kv_heads: Option<usize>,
+        window_size: Option<usize>,
+        block_size: Option<usize>,
+        m_size: Option<usize>,
+        num_experts: Option<usize>,
+    ) -> PyResult<Self> {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-        let inner = TitanTransformer::new(vocab_size, dim, num_layers, vb).map_err(to_py_err)?;
+        let mut config = Config::default();
+        config.vocab_size = vocab_size;
+        config.dim = dim;
+        config.num_layers = num_layers;
+        config.num_heads = num_heads.unwrap_or(8);
+        config.num_kv_heads = num_kv_heads.unwrap_or(2);
+        config.window_size = window_size.unwrap_or(512);
+        if let Some(b) = block_size { config.block_size = b; }
+        if let Some(m) = m_size { config.m_size = m; }
+        if let Some(e) = num_experts { config.num_experts = e; }
+
+        // Safety: Ensure dim is divisible by num_heads
+        if config.dim % config.num_heads != 0 {
+             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                 format!("Dimension {} must be divisible by num_heads {}", config.dim, config.num_heads)
+             ));
+        }
+
+        let inner = TitanTransformer::new(config, vb).map_err(to_py_err)?;
 
         // Initialize states
-        let num_heads = 8;
-        let head_dim = dim / num_heads;
-        let mut memory_states = Vec::with_capacity(num_layers);
-        let mut program_states = Vec::with_capacity(num_layers);
-        let mut kv_caches = Vec::with_capacity(num_layers);
-        for _ in 0..num_layers {
+        let head_dim = config.dim / config.num_heads;
+        let mut memory_states = Vec::with_capacity(config.num_layers);
+        let mut program_states = Vec::with_capacity(config.num_layers);
+        let mut kv_caches = Vec::with_capacity(config.num_layers);
+        for _ in 0..config.num_layers {
             // Multi-head memory state [H, Hd, Hd]
-            memory_states.push(Tensor::zeros((num_heads, head_dim, head_dim), DType::F32, &device).map_err(to_py_err)?);
-            program_states.push(Tensor::zeros((1, dim), DType::F32, &device).map_err(to_py_err)?);
+            memory_states.push(Tensor::zeros((config.num_heads, head_dim, head_dim), DType::F32, &device).map_err(to_py_err)?);
+            program_states.push(Tensor::zeros((1, config.dim), DType::F32, &device).map_err(to_py_err)?);
             kv_caches.push(None);
         }
 
         Ok(Self {
             inner,
             varmap,
-            dim,
-            num_layers,
+            config,
             memory_states,
             program_states,
             kv_caches,
@@ -92,13 +118,12 @@ impl PyTitanTransformer {
     #[doc = "Resets the persistent internal long-term memory, program states, and KV-cache to zero/empty."]
     fn reset_state(&mut self) -> PyResult<()> {
         let device = Device::Cpu;
-        let num_heads = 8;
-        let head_dim = self.dim / num_heads;
-        for i in 0..self.num_layers {
+        let head_dim = self.config.dim / self.config.num_heads;
+        for i in 0..self.config.num_layers {
             self.memory_states[i] =
-                Tensor::zeros((num_heads, head_dim, head_dim), DType::F32, &device).map_err(to_py_err)?;
+                Tensor::zeros((self.config.num_heads, head_dim, head_dim), DType::F32, &device).map_err(to_py_err)?;
             self.program_states[i] =
-                Tensor::zeros((1, self.dim), DType::F32, &device).map_err(to_py_err)?;
+                Tensor::zeros((1, self.config.dim), DType::F32, &device).map_err(to_py_err)?;
             self.kv_caches[i] = None;
         }
         Ok(())
@@ -173,7 +198,7 @@ impl PyTitanTransformer {
 
         // During training, we typically don't use KV cache or we want to reset it.
         // For simplicity, we'll reset it here.
-        for i in 0..self.num_layers {
+        for i in 0..self.config.num_layers {
              self.kv_caches[i] = None;
         }
 

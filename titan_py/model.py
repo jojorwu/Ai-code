@@ -5,8 +5,29 @@ class TitanTransformer:
     """
     High-level wrapper for the Titan model.
     """
-    def __init__(self, vocab_size: int, dim: int, num_layers: int):
-        self._inner = PyTitanTransformer(vocab_size, dim, num_layers)
+    def __init__(
+        self,
+        vocab_size: int,
+        dim: int,
+        num_layers: int,
+        num_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+        window_size: Optional[int] = None,
+        block_size: Optional[int] = None,
+        m_size: Optional[int] = None,
+        num_experts: Optional[int] = None,
+    ):
+        self._inner = PyTitanTransformer(
+            vocab_size,
+            dim,
+            num_layers,
+            num_heads,
+            num_kv_heads,
+            window_size,
+            block_size,
+            m_size,
+            num_experts
+        )
 
     def init_optimizer(self, lr: float) -> None:
         """Initializes the AdamW optimizer with the given learning rate."""
