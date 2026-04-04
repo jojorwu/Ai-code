@@ -1,5 +1,5 @@
 use candle_core::{Tensor, Result};
-use candle_nn::{VarBuilder, linear, Linear};
+use candle_nn::{VarBuilder, linear, conv1d, Conv1d, Conv1dConfig, Linear};
 
 /// Python Emulator Module.
 ///
@@ -8,6 +8,7 @@ use candle_nn::{VarBuilder, linear, Linear};
 pub struct PythonEmulator {
     up_proj: Linear,
     down_proj: Linear,
+    conv: Conv1d,
     // GRU Gates
     update_gate: Linear,
     reset_gate: Linear,
@@ -22,8 +23,17 @@ impl PythonEmulator {
     /// preventing the program state from being saturated by noise.
     pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
         // Bottleneck: compress information to captue higher-level instruction semantics
-        let up_proj = linear(dim, dim / 4, vb.pp("up_proj"))?;
-        let down_proj = linear(dim / 4, dim, vb.pp("down_proj"))?;
+        let bottleneck_dim = dim / 4;
+        let up_proj = linear(dim, bottleneck_dim, vb.pp("up_proj"))?;
+        let down_proj = linear(bottleneck_dim, dim, vb.pp("down_proj"))?;
+
+        let conv_cfg = Conv1dConfig {
+            padding: 1,
+            stride: 1,
+            dilation: 1,
+            groups: bottleneck_dim,
+        };
+        let conv = conv1d(bottleneck_dim, bottleneck_dim, 3, conv_cfg, vb.pp("conv"))?;
 
         let update_gate = linear(dim, dim, vb.pp("update_gate"))?;
         let reset_gate = linear(dim, dim, vb.pp("reset_gate"))?;
@@ -32,6 +42,7 @@ impl PythonEmulator {
         Ok(Self {
             up_proj,
             down_proj,
+            conv,
             update_gate,
             reset_gate,
             candidate_gate,
@@ -50,8 +61,14 @@ impl PythonEmulator {
     ///    $$ h_t = (1 - z_t) \odot h_{t-1} + z_t \odot \tilde{h}_t $$
     pub fn step(&self, instruction_rep: &Tensor, current_state: &Tensor) -> Result<Tensor> {
         // instruction_rep: [T, D]
-        // Use MLP to process instructions
-        let h = instruction_rep.apply(&self.up_proj)?;
+        // Use Bottleneck + Depthwise Conv to process instructions
+        let h = instruction_rep.apply(&self.up_proj)?; // [T, Bd]
+
+        // Local Context: Conv1D over sequence [1, Bd, T]
+        let h_conv = h.t()?.unsqueeze(0)?;
+        let h_conv = h_conv.apply(&self.conv)?;
+        let h = h_conv.squeeze(0)?.t()?; // [T, Bd]
+
         let h = candle_nn::ops::silu(&h)?;
         let x = h.apply(&self.down_proj)?; // [T, D]
 

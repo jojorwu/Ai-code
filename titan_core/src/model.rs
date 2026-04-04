@@ -24,6 +24,9 @@ pub struct Config {
     pub block_size: usize,
     pub m_size: usize,
     pub num_experts: usize,
+    pub use_weight_std: bool,
+    pub use_turbo_quant: bool,
+    pub drop_path_rate: f32,
 }
 
 impl Default for Config {
@@ -38,6 +41,9 @@ impl Default for Config {
             block_size: 4,
             m_size: 8,
             num_experts: 4,
+            use_weight_std: true,
+            use_turbo_quant: false,
+            drop_path_rate: 0.1,
         }
     }
 }
@@ -55,21 +61,74 @@ pub struct TitanTransformer {
     block_attn_res: crate::attn_res::BlockAttnRes,
 }
 
+/// Helper for Stochastic Depth (DropPath).
+pub fn drop_path(x: &Tensor, drop_prob: f32, is_training: bool) -> Result<Tensor> {
+    if !is_training || drop_prob <= 0.0 {
+        return Ok(x.clone());
+    }
+    let keep_prob = 1.0 - drop_prob;
+    let shape = x.shape();
+    let mut dims = vec![1; shape.dims().len()];
+    dims[0] = shape.dims()[0]; // Batch or Sequence
+    let rand = Tensor::rand(0f32, 1f32, dims, x.device())?;
+    let mask = rand.ge(drop_prob as f64)?.to_dtype(x.dtype())?;
+    x.broadcast_mul(&mask)? / keep_prob as f64
+}
+
+/// Helper for Weight Standardization.
+/// Normalizes the weights of a linear layer.
+pub fn weight_std(w: &Tensor) -> Result<Tensor> {
+    let mean = w.mean_keepdim(1)?;
+    let centered = w.broadcast_sub(&mean)?;
+    let var = centered.sqr()?.mean_keepdim(1)?;
+    let std = (var + 1e-5)?.sqrt()?;
+    centered.broadcast_div(&std)
+}
+
+/// A standardized linear layer.
+pub struct StdLinear {
+    inner: Linear,
+    use_std: bool,
+}
+
+impl StdLinear {
+    pub fn new(in_dim: usize, out_dim: usize, use_std: bool, vb: VarBuilder) -> Result<Self> {
+        let inner = linear(in_dim, out_dim, vb)?;
+        Ok(Self { inner, use_std })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if self.use_std {
+             let w = self.inner.weight();
+             let w_std = weight_std(w)?;
+             // We can't easily replace the weight in Linear, so we matmul manually
+             let x = x.matmul(&w_std.t()?)?;
+             if let Some(bias) = self.inner.bias() {
+                 x.broadcast_add(bias)
+             } else {
+                 Ok(x)
+             }
+        } else {
+             x.apply(&self.inner)
+        }
+    }
+}
+
 /// Feed-Forward Network (FFN) block using SwiGLU activation and depthwise Conv1D.
 pub struct FFN {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: StdLinear,
+    up_proj: StdLinear,
+    down_proj: StdLinear,
     conv: Conv1d,
 }
 
 impl FFN {
     /// Creates a new FFN block with Conv-GLU structure.
-    pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn new(dim: usize, use_std: bool, vb: VarBuilder) -> Result<Self> {
         let hidden_dim = (dim * 8) / 3;
-        let gate_proj = linear(dim, hidden_dim, vb.pp("gate_proj"))?;
-        let up_proj = linear(dim, hidden_dim, vb.pp("up_proj"))?;
-        let down_proj = linear(hidden_dim, dim, vb.pp("down_proj"))?;
+        let gate_proj = StdLinear::new(dim, hidden_dim, use_std, vb.pp("gate_proj"))?;
+        let up_proj = StdLinear::new(dim, hidden_dim, use_std, vb.pp("up_proj"))?;
+        let down_proj = StdLinear::new(hidden_dim, dim, use_std, vb.pp("down_proj"))?;
 
         // Depthwise convolution: in_channels == out_channels == groups
         let conv_cfg = Conv1dConfig {
@@ -91,7 +150,7 @@ impl FFN {
     /// Performs the forward pass of the FFN block with Conv-GLU.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // x: [T, D]
-        let gate = x.apply(&self.gate_proj)?; // [T, H]
+        let gate = self.gate_proj.forward(x)?; // [T, H]
 
         // Apply 1D conv over sequence dimension: [1, H, T]
         let gate = gate.t()?.unsqueeze(0)?;
@@ -99,15 +158,15 @@ impl FFN {
         let gate = gate.squeeze(0)?.t()?; // [T, H]
 
         let gate = candle_nn::ops::silu(&gate)?;
-        let up = x.apply(&self.up_proj)?;
+        let up = self.up_proj.forward(x)?;
         let h = (gate * up)?;
-        h.apply(&self.down_proj)
+        self.down_proj.forward(&h)
     }
 }
 
 /// Sparse Mixture of Experts (MoE) block with a Shared Expert and Top-1 routing.
 pub struct MoE {
-    router: Linear,
+    router: StdLinear,
     experts: Vec<FFN>,
     shared_expert: FFN,
     num_experts: usize,
@@ -115,13 +174,13 @@ pub struct MoE {
 
 impl MoE {
     /// Creates a new MoE block with a Shared Expert.
-    pub fn new(dim: usize, num_experts: usize, vb: VarBuilder) -> Result<Self> {
-        let router = linear(dim, num_experts, vb.pp("router"))?;
+    pub fn new(dim: usize, num_experts: usize, use_std: bool, vb: VarBuilder) -> Result<Self> {
+        let router = StdLinear::new(dim, num_experts, use_std, vb.pp("router"))?;
         let mut experts = Vec::with_capacity(num_experts);
         for i in 0..num_experts {
-            experts.push(FFN::new(dim, vb.pp(format!("expert_{}", i)))?);
+            experts.push(FFN::new(dim, use_std, vb.pp(format!("expert_{}", i)))?);
         }
-        let shared_expert = FFN::new(dim, vb.pp("shared_expert"))?;
+        let shared_expert = FFN::new(dim, use_std, vb.pp("shared_expert"))?;
         Ok(Self {
             router,
             experts,
@@ -133,7 +192,15 @@ impl MoE {
     /// Performs the forward pass of the MoE block with Top-1 routing and a Shared Expert.
     /// Returns (output, auxiliary_loss)
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
-        let router_logits = x.apply(&self.router)?;
+        let mut router_logits = self.router.forward(x)?;
+
+        // Noise-Gated Routing (Exploration)
+        // Add small Gaussian noise to logits during training to prevent routing collapse
+        if router_logits.device().is_cpu() {
+             let noise = Tensor::randn(0f32, 0.01f32, router_logits.shape(), router_logits.device())?;
+             router_logits = (router_logits + noise)?;
+        }
+
         let routing_weights = candle_nn::ops::softmax(&router_logits, candle_core::D::Minus1)?;
 
         // 1. Shared Expert processes all tokens
@@ -204,9 +271,9 @@ impl TitanTransformer {
                     config.window_size,
                     vb_layer.pp("attention")
                 )?,
-                memory: TitansMemory::new(config.dim, config.num_heads, vb_layer.pp("memory"))?,
+                memory: TitansMemory::new(config.dim, config.num_heads, config.use_turbo_quant, vb_layer.pp("memory"))?,
                 emulator: PythonEmulator::new(config.dim, vb_layer.pp("emulator"))?,
-                moe: MoE::new(config.dim, config.num_experts, vb_layer.pp("moe"))?,
+                moe: MoE::new(config.dim, config.num_experts, config.use_weight_std, vb_layer.pp("moe"))?,
                 norm_1: rms_norm(config.dim, 1e-5, vb_layer.pp("norm_1"))?,
                 norm_2: rms_norm(config.dim, 1e-5, vb_layer.pp("norm_2"))?,
                 gate_net: linear(config.dim, 3, vb_layer.pp("gate_net"))?,
@@ -244,6 +311,7 @@ impl TitanTransformer {
         memory_states: &mut [Tensor],
         program_states: &mut [Tensor],
         kv_caches: &mut [Option<(Tensor, Tensor)>],
+        is_training: bool,
     ) -> Result<(Tensor, Tensor)> {
         let (mut h, start_pos) = self.prepare_input(x, kv_caches)?;
         let mut total_aux_loss = Tensor::new(0f32, h.device())?;
@@ -259,7 +327,8 @@ impl TitanTransformer {
                 &mut program_states[i],
                 &mut kv_caches[i],
                 &block_summaries,
-                start_pos
+                start_pos,
+                is_training,
             )?;
 
             h = h_next;
@@ -305,6 +374,7 @@ impl TitanTransformer {
         kv_cache: &mut Option<(Tensor, Tensor)>,
         block_summaries: &[Tensor],
         start_pos: usize,
+        is_training: bool,
     ) -> Result<(Tensor, Tensor)> {
         let h_norm = h.apply(&layer.norm_1)?;
 
@@ -333,12 +403,14 @@ impl TitanTransformer {
 
         // 3. Block Residuals
         let attn_res_out = self.block_attn_res.forward(block_summaries, &parallel_out, &self.rope, start_pos)?;
-        let mut h = (h + attn_res_out.broadcast_mul(&layer.layerscale_1)?)?;
+        let layer_out = drop_path(&attn_res_out.broadcast_mul(&layer.layerscale_1)?, self.config.drop_path_rate, is_training)?;
+        let mut h = (h + layer_out)?;
 
         // 4. Sequential MoE
         let h_ffn_norm = h.apply(&layer.norm_2)?;
         let (moe_out, aux_loss) = layer.moe.forward(&h_ffn_norm)?;
-        h = (h + moe_out.broadcast_mul(&layer.layerscale_2)?)?;
+        let moe_res = drop_path(&moe_out.broadcast_mul(&layer.layerscale_2)?, self.config.drop_path_rate, is_training)?;
+        h = (h + moe_res)?;
 
         Ok((h, aux_loss))
     }

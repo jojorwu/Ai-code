@@ -35,7 +35,7 @@ pub struct PyTitanTransformer {
 #[pymethods]
 impl PyTitanTransformer {
     #[new]
-    #[pyo3(signature = (vocab_size, dim, num_layers, num_heads=None, num_kv_heads=None, window_size=None, block_size=None, m_size=None, num_experts=None))]
+    #[pyo3(signature = (vocab_size, dim, num_layers, num_heads=None, num_kv_heads=None, window_size=None, block_size=None, m_size=None, num_experts=None, use_weight_std=None, use_turbo_quant=None, drop_path_rate=None))]
     #[doc = "Initializes a new Titan Transformer with advanced configuration."]
     fn new(
         vocab_size: usize,
@@ -47,6 +47,9 @@ impl PyTitanTransformer {
         block_size: Option<usize>,
         m_size: Option<usize>,
         num_experts: Option<usize>,
+        use_weight_std: Option<bool>,
+        use_turbo_quant: Option<bool>,
+        drop_path_rate: Option<f32>,
     ) -> PyResult<Self> {
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -62,6 +65,9 @@ impl PyTitanTransformer {
         if let Some(b) = block_size { config.block_size = b; }
         if let Some(m) = m_size { config.m_size = m; }
         if let Some(e) = num_experts { config.num_experts = e; }
+        if let Some(ws) = use_weight_std { config.use_weight_std = ws; }
+        if let Some(tq) = use_turbo_quant { config.use_turbo_quant = tq; }
+        if let Some(dp) = drop_path_rate { config.drop_path_rate = dp; }
 
         // Safety: Ensure dim is divisible by num_heads
         if config.dim % config.num_heads != 0 {
@@ -160,7 +166,7 @@ impl PyTitanTransformer {
 
         let (out, _aux_loss) = self
             .inner
-            .forward(&x, &mut self.memory_states, &mut self.program_states, &mut self.kv_caches)
+            .forward(&x, &mut self.memory_states, &mut self.program_states, &mut self.kv_caches, false)
             .map_err(to_py_err)?;
 
         let (rows, cols) = out.dims2().map_err(to_py_err)?;
@@ -207,7 +213,7 @@ impl PyTitanTransformer {
 
         let (logits, aux_loss) = self
             .inner
-            .forward(&x, &mut self.memory_states, &mut self.program_states, &mut self.kv_caches)
+            .forward(&x, &mut self.memory_states, &mut self.program_states, &mut self.kv_caches, true)
             .map_err(to_py_err)?;
 
         let log_sm = candle_nn::ops::log_softmax(&logits, candle_core::D::Minus1).map_err(to_py_err)?;

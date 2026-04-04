@@ -12,6 +12,9 @@ class PyTitanTransformer:
         block_size: Optional[int] = None,
         m_size: Optional[int] = None,
         num_experts: Optional[int] = None,
+        use_weight_std: Optional[bool] = None,
+        use_turbo_quant: Optional[bool] = None,
+        drop_path_rate: Optional[float] = None,
     ) -> None: ...
     def init_optimizer(self, lr: float) -> None: ...
     def save_weights(self, path: str) -> None: ...

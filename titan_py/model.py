@@ -30,6 +30,9 @@ class TitanTransformer:
         block_size: Optional[int] = None,
         m_size: Optional[int] = None,
         num_experts: Optional[int] = None,
+        use_weight_std: Optional[bool] = None,
+        use_turbo_quant: Optional[bool] = None,
+        drop_path_rate: Optional[float] = None,
     ):
         self._inner = PyTitanTransformer(
             vocab_size,
@@ -40,7 +43,10 @@ class TitanTransformer:
             window_size,
             block_size,
             m_size,
-            num_experts
+            num_experts,
+            use_weight_std,
+            use_turbo_quant,
+            drop_path_rate
         )
 
     def init_optimizer(self, lr: float) -> None:
