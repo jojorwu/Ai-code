@@ -15,10 +15,11 @@ pub struct PythonEmulator {
 }
 
 impl PythonEmulator {
-    /// Creates a new `PythonEmulator` instance with a GRU-based state update.
+    /// Creates a new `PythonEmulator` instance with a bottleneck GRU state update.
     pub fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let up_proj = linear(dim, dim * 2, vb.pp("up_proj"))?;
-        let down_proj = linear(dim * 2, dim, vb.pp("down_proj"))?;
+        // Bottleneck: compress information to captue higher-level instruction semantics
+        let up_proj = linear(dim, dim / 4, vb.pp("up_proj"))?;
+        let down_proj = linear(dim / 4, dim, vb.pp("down_proj"))?;
 
         let update_gate = linear(dim, dim, vb.pp("update_gate"))?;
         let reset_gate = linear(dim, dim, vb.pp("reset_gate"))?;
@@ -35,10 +36,11 @@ impl PythonEmulator {
 
     /// Updates the persistent internal program state using a GRU mechanism.
     pub fn step(&self, instruction_rep: &Tensor, current_state: &Tensor) -> Result<Tensor> {
+        // instruction_rep: [T, D]
         // Use MLP to process instructions
         let h = instruction_rep.apply(&self.up_proj)?;
         let h = candle_nn::ops::silu(&h)?;
-        let x = h.apply(&self.down_proj)?;
+        let x = h.apply(&self.down_proj)?; // [T, D]
 
         // Aggregate instructions [1, D]
         let x_agg = x.mean_keepdim(0)?;

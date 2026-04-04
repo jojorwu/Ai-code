@@ -110,22 +110,18 @@ impl MoE {
             let expert_out = self.experts[i].forward(x)?;
 
             // Mask: 1.0 if expert_indices == i, 0.0 otherwise
-            let mask = expert_indices.eq(i as u32)?; // [T] (U8)
-            let weight = routing_weights.narrow(candle_core::D::Minus1, i, 1)?.squeeze(candle_core::D::Minus1)?;
+            let mask = expert_indices.eq(i as u32)?.unsqueeze(candle_core::D::Minus1)?;
+            let weight = routing_weights.narrow(candle_core::D::Minus1, i, 1)?;
 
-            // Standardize both to F32 for multiplication then back to original.
-            let mask_f32 = mask.to_dtype(candle_core::DType::F32)?;
-            let combined_gate = (mask_f32 * weight)?.to_dtype(x.dtype())?;
-            let combined_gate = combined_gate.unsqueeze(candle_core::D::Minus1)?;
+            let combined_gate = (mask.to_dtype(candle_core::DType::F32)?.broadcast_mul(&weight))?.to_dtype(x.dtype())?;
 
             final_output = (final_output + expert_out.broadcast_mul(&combined_gate)?)?;
         }
 
-        // 3. Auxiliary Balancing Loss
+        // 3. Auxiliary Balancing Loss (Load Balancing)
         let mut aux_loss = Tensor::new(0f32, x.device())?;
-
         let t_size = routing_weights.dim(0)? as f32;
-        let p_mean = routing_weights.mean(0)?; // [E]
+        let p_mean = routing_weights.mean(0)?;
 
         for i in 0..self.num_experts {
              let f_i = expert_indices.eq(i as u32)?.to_dtype(candle_core::DType::F32)?.sum_all()?.to_vec0::<f32>()? / t_size;
@@ -146,7 +142,7 @@ pub struct TitanLayer {
     pub moe: MoE,
     pub norm_1: RmsNorm,
     pub norm_2: RmsNorm,
-    pub branch_gates: Tensor,
+    pub gate_net: Linear,
     pub layerscale_1: Tensor,
     pub layerscale_2: Tensor,
 }
@@ -168,7 +164,7 @@ impl TitanTransformer {
                 moe: MoE::new(dim, 4, vb_layer.pp("moe"))?, // 4 experts + shared expert
                 norm_1: rms_norm(dim, 1e-5, vb_layer.pp("norm_1"))?,
                 norm_2: rms_norm(dim, 1e-5, vb_layer.pp("norm_2"))?,
-                branch_gates: vb_layer.get_with_hints((3,), "branch_gates", Init::Const(0.1))?,
+                gate_net: linear(dim, 3, vb_layer.pp("gate_net"))?,
                 layerscale_1: vb_layer.get_with_hints((dim,), "layerscale_1", Init::Const(0.1))?,
                 layerscale_2: vb_layer.get_with_hints((dim,), "layerscale_2", Init::Const(0.1))?,
             });
@@ -250,15 +246,18 @@ impl TitanTransformer {
             let new_prog = layer.emulator.step(&h_quantized, &program_states[i])?;
             program_states[i] = new_prog.clone();
 
-            // Aggregate parallel components with learnable gating (vectorized)
-            let gates = candle_nn::ops::softmax(&layer.branch_gates, 0)?;
-            let g_attn = gates.narrow(0, 0, 1)?;
-            let g_mem = gates.narrow(0, 1, 1)?;
-            let g_emu = gates.narrow(0, 2, 1)?;
+            // Aggregate parallel components with dynamic gating
+            let gates = h_norm.apply(&layer.gate_net)?;
+            let gates = candle_nn::ops::softmax(&gates, candle_core::D::Minus1)?;
+
+            let g_attn = gates.narrow(candle_core::D::Minus1, 0, 1)?;
+            let g_mem = gates.narrow(candle_core::D::Minus1, 1, 1)?;
+            let g_emu = gates.narrow(candle_core::D::Minus1, 2, 1)?;
 
             let mut parallel_out = attn_out.broadcast_mul(&g_attn)?;
             parallel_out = (parallel_out + mem_out.broadcast_mul(&g_mem)?)?;
-            parallel_out = (parallel_out.broadcast_add(&new_prog.broadcast_mul(&g_emu)?))?;
+            // new_prog: [1, D], g_emu: [T, 1]
+            parallel_out = (parallel_out + new_prog.broadcast_mul(&g_emu)?)?;
 
             // 4. Block Attention Residuals
             let attn_res_out = self.block_attn_res.forward(&block_summaries, &parallel_out, &self.rope, start_pos)?;

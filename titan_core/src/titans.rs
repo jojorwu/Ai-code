@@ -12,6 +12,7 @@ pub struct TitansMemory {
     val_proj: Linear,
     gate_proj: Linear,
     out_proj: Linear,
+    surprise_proj: Linear,
     eta: Tensor,
     decay: Tensor,
     num_heads: usize,
@@ -28,6 +29,7 @@ impl TitansMemory {
         let val_proj = linear(dim, dim, vb.pp("val_proj"))?;
         let gate_proj = linear(dim, dim, vb.pp("gate_proj"))?;
         let out_proj = linear(dim, dim, vb.pp("out_proj"))?;
+        let surprise_proj = linear(head_dim, 1, vb.pp("surprise_proj"))?;
 
         // Per-head learnable parameters [H]
         let eta = vb.get((num_heads,), "eta")?;
@@ -38,6 +40,7 @@ impl TitansMemory {
             val_proj,
             gate_proj,
             out_proj,
+            surprise_proj,
             eta,
             decay,
             num_heads,
@@ -132,10 +135,12 @@ impl TitansMemory {
             let yt = kt.matmul(&current_m)?;
             outputs.push(yt.clone());
 
-            // 2. Compute surprise gate: how different is expected v_t from retrieved y_t?
+            // 2. Compute surprise gate: learnable surprise from retrieval error
             let diff = (vt - yt)?;
-            let l2_norm_sq = diff.sqr()?.sum_all()?.to_vec0::<f32>()?;
-            let surprise_refined = (l2_norm_sq as f64).tanh();
+            // surprise_score: [1, 1]
+            let surprise_score = diff.apply(&self.surprise_proj)?;
+            let surprise_val = surprise_score.sum_all()?.to_dtype(candle_core::DType::F32)?.to_vec0::<f32>()?;
+            let surprise_refined = (surprise_val as f64).tanh();
             let gt = gate_means[t] as f64 * surprise_refined;
 
             // 3. Delta update: ΔM = (v_t - y_t) ⊗ k_t
