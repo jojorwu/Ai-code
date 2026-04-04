@@ -19,6 +19,7 @@ class PyTitanTransformer:
         use_mla: Optional[bool] = None,
         kv_lora_rank: Optional[int] = None,
         qk_lora_rank: Optional[int] = None,
+        use_aux_loss_free_lb: Optional[bool] = None,
         drop_path_rate: Optional[float] = None,
     ) -> None: ...
     def init_optimizer(self, lr: float) -> None: ...

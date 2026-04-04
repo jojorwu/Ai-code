@@ -31,6 +31,7 @@ pub struct Config {
     pub use_mla: bool,
     pub kv_lora_rank: usize,
     pub qk_lora_rank: usize,
+    pub use_aux_loss_free_lb: bool,
     pub drop_path_rate: f32,
 }
 
@@ -53,6 +54,7 @@ impl Default for Config {
             use_mla: false,
             kv_lora_rank: 512,
             qk_lora_rank: 128,
+            use_aux_loss_free_lb: true,
             drop_path_rate: 0.1,
         }
     }
@@ -180,22 +182,31 @@ pub struct MoE {
     experts: Vec<FFN>,
     shared_expert: FFN,
     num_experts: usize,
+    expert_bias: Option<Tensor>,
 }
 
 impl MoE {
     /// Creates a new MoE block with a Shared Expert.
-    pub fn new(dim: usize, num_experts: usize, use_std: bool, vb: VarBuilder) -> Result<Self> {
+    pub fn new(dim: usize, num_experts: usize, use_std: bool, use_aux_free: bool, vb: VarBuilder) -> Result<Self> {
         let router = StdLinear::new(dim, num_experts, use_std, vb.pp("router"))?;
         let mut experts = Vec::with_capacity(num_experts);
         for i in 0..num_experts {
             experts.push(FFN::new(dim, use_std, vb.pp(format!("expert_{}", i)))?);
         }
         let shared_expert = FFN::new(dim, use_std, vb.pp("shared_expert"))?;
+
+        let expert_bias = if use_aux_free {
+             Some(vb.get_with_hints((num_experts,), "expert_bias", Init::Const(0.0))?)
+        } else {
+             None
+        };
+
         Ok(Self {
             router,
             experts,
             shared_expert,
             num_experts,
+            expert_bias,
         })
     }
 
@@ -203,6 +214,11 @@ impl MoE {
     /// Returns (output, auxiliary_loss)
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         let mut router_logits = self.router.forward(x)?;
+
+        // Auxiliary-loss-free Load Balancing (DeepSeek-V3 style)
+        if let Some(bias) = &self.expert_bias {
+             router_logits = router_logits.broadcast_add(bias)?;
+        }
 
         // Noise-Gated Routing (Exploration)
         // Add small Gaussian noise to logits during training to prevent routing collapse
@@ -289,7 +305,7 @@ impl TitanTransformer {
                 )?,
                 memory: TitansMemory::new(config.dim, config.num_heads, config.use_turbo_quant, vb_layer.pp("memory"))?,
                 emulator: PythonEmulator::new(config.dim, vb_layer.pp("emulator"))?,
-                moe: MoE::new(config.dim, config.num_experts, config.use_weight_std, vb_layer.pp("moe"))?,
+                moe: MoE::new(config.dim, config.num_experts, config.use_weight_std, config.use_aux_loss_free_lb, vb_layer.pp("moe"))?,
                 norm_1: rms_norm(config.dim, 1e-5, vb_layer.pp("norm_1"))?,
                 norm_2: rms_norm(config.dim, 1e-5, vb_layer.pp("norm_2"))?,
                 gate_net: linear(config.dim, 3, vb_layer.pp("gate_net"))?,

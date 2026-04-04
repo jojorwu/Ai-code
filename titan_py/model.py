@@ -37,6 +37,7 @@ class TitanTransformer:
         use_mla: Optional[bool] = None,
         kv_lora_rank: Optional[int] = None,
         qk_lora_rank: Optional[int] = None,
+        use_aux_loss_free_lb: Optional[bool] = None,
         drop_path_rate: Optional[float] = None,
     ):
         self._inner = PyTitanTransformer(
@@ -56,6 +57,7 @@ class TitanTransformer:
             use_mla,
             kv_lora_rank,
             qk_lora_rank,
+            use_aux_loss_free_lb,
             drop_path_rate
         )
 

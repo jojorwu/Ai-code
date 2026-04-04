@@ -35,7 +35,7 @@ pub struct PyTitanTransformer {
 #[pymethods]
 impl PyTitanTransformer {
     #[new]
-    #[pyo3(signature = (vocab_size, dim, num_layers, num_heads=None, num_kv_heads=None, window_size=None, block_size=None, m_size=None, num_experts=None, global_attn_period=None, use_weight_std=None, use_turbo_quant=None, use_differential_attn=None, use_mla=None, kv_lora_rank=None, qk_lora_rank=None, drop_path_rate=None))]
+    #[pyo3(signature = (vocab_size, dim, num_layers, num_heads=None, num_kv_heads=None, window_size=None, block_size=None, m_size=None, num_experts=None, global_attn_period=None, use_weight_std=None, use_turbo_quant=None, use_differential_attn=None, use_mla=None, kv_lora_rank=None, qk_lora_rank=None, use_aux_loss_free_lb=None, drop_path_rate=None))]
     #[doc = "Initializes a new Titan Transformer with advanced configuration."]
     fn new(
         vocab_size: usize,
@@ -54,6 +54,7 @@ impl PyTitanTransformer {
         use_mla: Option<bool>,
         kv_lora_rank: Option<usize>,
         qk_lora_rank: Option<usize>,
+        use_aux_loss_free_lb: Option<bool>,
         drop_path_rate: Option<f32>,
     ) -> PyResult<Self> {
         let device = Device::Cpu;
@@ -77,6 +78,7 @@ impl PyTitanTransformer {
         if let Some(mla) = use_mla { config.use_mla = mla; }
         if let Some(kv_rank) = kv_lora_rank { config.kv_lora_rank = kv_rank; }
         if let Some(qk_rank) = qk_lora_rank { config.qk_lora_rank = qk_rank; }
+        if let Some(aux_free) = use_aux_loss_free_lb { config.use_aux_loss_free_lb = aux_free; }
         if let Some(dp) = drop_path_rate { config.drop_path_rate = dp; }
 
         // Safety: Ensure dim is divisible by num_heads
